@@ -1,0 +1,39 @@
+p, super_admin, *, /*, (GET|POST|PUT|PATCH|DELETE)
+p, admin, tenant_demo, /api/v1/auth/me, GET
+p, admin, tenant_demo, /api/v1/auth/logout, POST
+p, admin, tenant_demo, /api/v1/tasks, POST
+p, admin, tenant_demo, /api/v1/tasks, GET
+p, admin, tenant_demo, /api/v1/tasks/:id, GET
+p, admin, tenant_demo, /api/v1/tasks/:id/cancel, POST
+p, admin, tenant_demo, /api/v1/tasks/:id/resume, POST
+p, admin, tenant_demo, /api/v1/uploads, POST
+p, admin, tenant_demo, /api/v1/files, GET
+p, admin, tenant_demo, /api/v1/download, GET
+p, admin, tenant_demo, /api/v1/tools/catalog, GET
+p, admin, tenant_demo, /api/v1/memories/search, POST
+p, admin, tenant_demo, /api/v1/memories/reviews, GET
+p, admin, tenant_demo, /api/v1/memories/reviews/:id/approve, POST
+p, admin, tenant_demo, /api/v1/memories/reviews/:id/reject, POST
+p, admin, tenant_demo, /api/v1/policy/proposals, GET
+p, admin, tenant_demo, /api/v1/policy/proposals/:id/approve, POST
+p, admin, tenant_demo, /api/v1/policy/proposals/:id/reject, POST
+p, admin, tenant_demo, /api/v1/traces/:id, GET
+p, admin, tenant_demo, /api/v1/traces/:id/timeline, GET
+p, admin, tenant_demo, /api/v1/metrics/agents, GET
+p, admin, tenant_demo, /api/v1/ws/:id, GET
+
+p, operator, tenant_demo, /api/v1/tasks, POST
+p, operator, tenant_demo, /api/v1/tasks, GET
+p, operator, tenant_demo, /api/v1/tasks/:id, GET
+p, operator, tenant_demo, /api/v1/tasks/:id/cancel, POST
+p, operator, tenant_demo, /api/v1/uploads, POST
+p, operator, tenant_demo, /api/v1/files, GET
+p, operator, tenant_demo, /api/v1/download, GET
+p, operator, tenant_demo, /api/v1/memories/search, POST
+
+p, viewer, tenant_demo, /api/v1/tasks, GET
+p, viewer, tenant_demo, /api/v1/tasks/:id, GET
+p, viewer, tenant_demo, /api/v1/files, GET
+p, viewer, tenant_demo, /api/v1/download, GET
+
+g, local_user, admin, tenant_demo

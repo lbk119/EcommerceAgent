@@ -6,9 +6,13 @@ import (
 	"os"
 	"time"
 
+	"DeepAgent/gateway/internal/auth"
+	"DeepAgent/gateway/internal/authorization"
 	"DeepAgent/gateway/internal/config"
+	"DeepAgent/gateway/internal/handlers"
 	"DeepAgent/gateway/internal/proxy"
 	"DeepAgent/gateway/internal/router"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -23,8 +27,21 @@ func main() {
 		gin.SetMode(cfg.Mode)
 	}
 
+	userStore := auth.NewStaticUserStore()
+	tokenManager, err := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTExpiresIn)
+	if err != nil {
+		slog.Error("initialize gateway auth", "error", err)
+		os.Exit(1)
+	}
+	authHandler := handlers.NewAuthHandler(userStore, tokenManager)
+	enforcer, err := authorization.NewEnforcer(cfg.CasbinModel, cfg.CasbinPolicy)
+	if err != nil {
+		slog.Error("initialize casbin authorization", "error", err)
+		os.Exit(1)
+	}
+
 	brainProxy := proxy.NewBrainProxy(cfg.PythonBrainURL)
-	engine := router.New(cfg, brainProxy)
+	engine := router.New(cfg, brainProxy, authHandler, tokenManager, userStore, enforcer)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,

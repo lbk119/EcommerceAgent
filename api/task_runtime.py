@@ -96,6 +96,55 @@ class TaskRuntime:
         async with self._lock:
             return self._conversation_latest_task.get(task_or_conversation_id, task_or_conversation_id)
 
+    async def get_scoped(self, task_or_conversation_id: str, identity: dict) -> Optional[dict]:
+        """
+        按身份作用域读取任务状态。
+
+        Go Gateway 已经完成“这个用户能不能访问任务 API”的 Casbin 判断；这里继续做资源级隔离：
+        同样有 API 权限的用户，也只能读取自己 tenant/user/shop 作用域下创建的 task/conversation。
+        """
+        async with self._lock:
+            task_id = self._conversation_latest_task.get(task_or_conversation_id, task_or_conversation_id)
+            state = self._states.get(task_id)
+            if not state or not self._matches_identity(state, identity):
+                return None
+            return dict(state)
+
+    async def list_scoped(self, identity: dict) -> list[dict]:
+        """只列出当前网关身份可见的任务，避免跨租户看到其他会话的运行状态。"""
+        async with self._lock:
+            return [dict(state) for state in self._states.values() if self._matches_identity(state, identity)]
+
+    async def owns_conversation(self, conversation_id: str, identity: dict) -> bool:
+        """
+        判断 conversation_id 是否属于当前身份。
+
+        文件列表和下载使用 output/session_{conversation_id} 作为目录，但真正的归属关系不能由路径决定，
+        必须回到任务元数据中确认这个 conversation 是由当前 tenant/user/shop 创建的。
+        """
+        async with self._lock:
+            task_id = self._conversation_latest_task.get(conversation_id, conversation_id)
+            state = self._states.get(task_id)
+            return bool(state and self._matches_identity(state, identity))
+
+    async def conversation_exists(self, conversation_id: str) -> bool:
+        """
+        判断 conversation 是否已经被登记过。
+
+        新任务允许创建新 conversation，但不能复用别人已有的 conversation_id；否则不同租户可能写入同一个
+        output/session_{conversation_id} 目录，形成文件和 WebSocket 会话混用。
+        """
+        async with self._lock:
+            task_id = self._conversation_latest_task.get(conversation_id, conversation_id)
+            return task_id in self._states
+
+    @staticmethod
+    def _matches_identity(state: dict, identity: dict) -> bool:
+        return all(
+            state.get(key) == identity.get(key)
+            for key in ("tenant_id", "user_id", "shop_id")
+        )
+
     async def cancel(self, thread_id: str) -> bool:
         async with self._lock:
             task = self._tasks.get(thread_id)

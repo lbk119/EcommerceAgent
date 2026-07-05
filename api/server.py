@@ -1,8 +1,8 @@
-import uuid
 import asyncio
+import uuid
 import uvicorn
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -69,6 +69,50 @@ class ResumeTaskRequest(BaseModel):
     decision: str
     instruction: str = ""
 
+
+def trusted_identity(http_request: Request, tenant_id: str, user_id: str, shop_id: str) -> MemoryIdentity:
+    """解析可信身份：网关注入的 Header 优先，body/query 只作为本地直连调试兜底。"""
+    return MemoryIdentity(
+        tenant_id=http_request.headers.get("X-Tenant-ID") or tenant_id,
+        user_id=http_request.headers.get("X-User-ID") or user_id,
+        shop_id=http_request.headers.get("X-Shop-ID") or shop_id,
+    )
+
+
+def identity_scope(identity: MemoryIdentity) -> dict:
+    """转换为 task_runtime 使用的身份字典，确保所有资源级校验使用同一组字段。"""
+    return {
+        "tenant_id": identity.tenant_id,
+        "user_id": identity.user_id,
+        "shop_id": identity.shop_id,
+    }
+
+
+def session_dir_for(conversation_id: str) -> Path:
+    """
+    根据 conversation_id 定位 Agent 产物目录。
+
+    目录名只能由服务端拼接，不能接受前端传入的绝对 path；真正的归属关系由 task_runtime 元数据校验。
+    """
+    return (output_dir / f"session_{conversation_id}").resolve()
+
+
+def resolve_session_file(conversation_id: str, filename: str) -> Path:
+    """把会话内文件名解析为绝对路径，并阻止 .. 或绝对路径逃逸到会话目录之外。"""
+    if not filename or Path(filename).is_absolute():
+        raise ValueError("文件名无效")
+    session_dir = session_dir_for(conversation_id)
+    candidate = (session_dir / filename).resolve()
+    if not candidate.is_relative_to(session_dir):
+        raise ValueError("拒绝访问: 文件不属于当前会话目录")
+    return candidate
+
+
+async def ensure_conversation_access(conversation_id: str, identity: MemoryIdentity) -> None:
+    """确认 conversation 属于当前 tenant/user/shop，文件列表和下载都必须先通过这里。"""
+    if not await task_runtime.owns_conversation(conversation_id, identity_scope(identity)):
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+
 @app.on_event("startup")
 async def startup_event():
     """
@@ -112,27 +156,30 @@ async def start_agent_task(payload: dict):
 
 
 @app.post("/api/task")
-async def run_task(request: TaskRequest):
+async def run_task(request: TaskRequest, http_request: Request):
     # 1. [ID 初始化] conversation_id 兼容旧前端 thread_id；task_id 是单次后台执行。
     conversation_id = request.conversation_id or request.thread_id or str(uuid.uuid4())
     task_id = request.task_id or str(uuid.uuid4())
+    identity = trusted_identity(http_request, request.tenant_id, request.user_id, request.shop_id)
+    if await task_runtime.conversation_exists(conversation_id) and not await task_runtime.owns_conversation(conversation_id, identity_scope(identity)):
+        raise HTTPException(status_code=403, detail="无权复用该会话")
     payload = {
         "query": request.query,
         "conversation_id": conversation_id,
         "thread_id": conversation_id,
         "task_id": task_id,
-        "tenant_id": request.tenant_id,
-        "user_id": request.user_id,
-        "shop_id": request.shop_id,
+        "tenant_id": identity.tenant_id,
+        "user_id": identity.user_id,
+        "shop_id": identity.shop_id,
     }
 
     # 2. [后台执行] 异步运行 Agent，不阻塞主线程
     try:
         await task_runtime.enqueue(task_id, request.query, metadata={
             "conversation_id": conversation_id,
-            "tenant_id": request.tenant_id,
-            "user_id": request.user_id,
-            "shop_id": request.shop_id,
+            "tenant_id": identity.tenant_id,
+            "user_id": identity.user_id,
+            "shop_id": identity.shop_id,
         })
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -143,30 +190,39 @@ async def run_task(request: TaskRequest):
 
 
 @app.get("/api/tasks")
-async def list_tasks():
-    return {"tasks": await task_runtime.list()}
+async def list_tasks(http_request: Request):
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    return {"tasks": await task_runtime.list_scoped(identity_scope(identity))}
 
 
 @app.get("/api/task/{thread_id}")
-async def get_task(thread_id: str):
-    task_id = await task_runtime.resolve_task_id(thread_id)
-    task = await task_runtime.get(task_id)
+async def get_task(thread_id: str, http_request: Request):
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    task = await task_runtime.get_scoped(thread_id, identity_scope(identity))
     if not task:
         return {"error": "任务不存在", "thread_id": thread_id}
     return task
 
 
 @app.post("/api/task/{thread_id}/cancel")
-async def cancel_task(thread_id: str):
+async def cancel_task(thread_id: str, http_request: Request):
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
     task_id = await task_runtime.resolve_task_id(thread_id)
+    task = await task_runtime.get_scoped(task_id, identity_scope(identity))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
     cancelled = await task_runtime.cancel(task_id)
     return {"thread_id": thread_id, "task_id": task_id, "cancelled": cancelled}
 
 
 @app.post("/api/task/{thread_id}/resume")
-async def resume_task(thread_id: str, request: ResumeTaskRequest):
+async def resume_task(thread_id: str, request: ResumeTaskRequest, http_request: Request):
     try:
+        identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
         task_id = await task_runtime.resolve_task_id(thread_id)
+        task = await task_runtime.get_scoped(task_id, identity_scope(identity))
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在或无权访问")
         resumed = await task_runtime.resume(task_id, request.decision, request.instruction)
         return {"thread_id": thread_id, "task_id": task_id, "resumed": resumed, "decision": request.decision}
     except ValueError as error:
@@ -174,12 +230,8 @@ async def resume_task(thread_id: str, request: ResumeTaskRequest):
 
 
 @app.post("/api/memories/search")
-async def search_memories(request: MemorySearchRequest):
-    identity = MemoryIdentity(
-        tenant_id=request.tenant_id,
-        user_id=request.user_id,
-        shop_id=request.shop_id,
-    )
+async def search_memories(request: MemorySearchRequest, http_request: Request):
+    identity = trusted_identity(http_request, request.tenant_id, request.user_id, request.shop_id)
     return {"memories": retrieve_long_term_memories(identity, request.query, request.top_k)}
 
 
@@ -190,19 +242,27 @@ async def get_tool_catalog():
 
 
 @app.get("/api/traces/{task_id}")
-async def get_task_traces(task_id: str):
+async def get_task_traces(task_id: str, http_request: Request):
     """
     返回单个任务的原始 trace 事件。
 
     这个接口直接读取 agent_traces.jsonl，适合排障和前端详情页；后续如果 trace 落到数据库，保持
     返回结构不变即可。
     """
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    task = await task_runtime.get_scoped(task_id, identity_scope(identity))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
     return {"task_id": task_id, "events": list_task_traces(task_id)}
 
 
 @app.get("/api/traces/{task_id}/timeline")
-async def get_task_trace_timeline(task_id: str):
+async def get_task_trace_timeline(task_id: str, http_request: Request):
     """返回前端更容易渲染的任务时间线：Agent、工具、耗时、token 和失败点。"""
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    task = await task_runtime.get_scoped(task_id, identity_scope(identity))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
     return build_task_timeline(task_id)
 
 
@@ -214,42 +274,54 @@ async def get_agent_metrics():
 
 @app.get("/api/memories/reviews")
 async def list_memory_reviews(
+    http_request: Request,
     tenant_id: str = "default_tenant",
     user_id: str = "local_user",
     shop_id: str = "default_shop",
     status: str = "pending",
     limit: int = 50,
 ):
-    identity = MemoryIdentity(tenant_id=tenant_id, user_id=user_id, shop_id=shop_id)
+    identity = trusted_identity(http_request, tenant_id, user_id, shop_id)
     return {"reviews": get_memory_store().list_reviews(identity, status=status, limit=limit)}
 
 
 @app.post("/api/memories/reviews/{review_id}/approve")
-async def approve_memory_review(review_id: str, request: MemoryReviewActionRequest):
+async def approve_memory_review(review_id: str, request: MemoryReviewActionRequest, http_request: Request):
+    reviewer_id = http_request.headers.get("X-User-ID") or request.reviewer_id
     try:
-        return get_memory_store().approve_review(review_id, request.reviewer_id, request.comment)
+        return get_memory_store().approve_review(review_id, reviewer_id, request.comment)
     except ValueError as error:
         return {"error": str(error), "review_id": review_id}
 
 
 @app.post("/api/memories/reviews/{review_id}/reject")
-async def reject_memory_review(review_id: str, request: MemoryReviewActionRequest):
+async def reject_memory_review(review_id: str, request: MemoryReviewActionRequest, http_request: Request):
+    reviewer_id = http_request.headers.get("X-User-ID") or request.reviewer_id
     try:
-        return get_memory_store().reject_review(review_id, request.reviewer_id, request.comment)
+        return get_memory_store().reject_review(review_id, reviewer_id, request.comment)
     except ValueError as error:
         return {"error": str(error), "review_id": review_id}
 
 
 @app.get("/api/policy/proposals")
-async def get_policy_proposals(status: str = None):
-    return {"proposals": list_policy_proposals(status)}
+async def get_policy_proposals(http_request: Request, status: str = None):
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    proposals = []
+    for proposal in list_policy_proposals(status):
+        if await task_runtime.get_scoped(proposal.get("session_id", ""), identity_scope(identity)):
+            proposals.append(proposal)
+    return {"proposals": proposals}
 
 
 @app.post("/api/policy/proposals/{proposal_id}/approve")
-async def approve_policy(proposal_id: str):
+async def approve_policy(proposal_id: str, http_request: Request):
     try:
         from agent.main_agent import reload_agent_policy
 
+        identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+        proposal = next((item for item in list_policy_proposals() if item.get("proposal_id") == proposal_id), None)
+        if not proposal or not await task_runtime.get_scoped(proposal.get("session_id", ""), identity_scope(identity)):
+            raise HTTPException(status_code=404, detail="策略建议不存在或无权访问")
         proposal = approve_policy_proposal(proposal_id)
         reload_agent_policy()
         return proposal
@@ -258,8 +330,12 @@ async def approve_policy(proposal_id: str):
 
 
 @app.post("/api/policy/proposals/{proposal_id}/reject")
-async def reject_policy(proposal_id: str):
+async def reject_policy(proposal_id: str, http_request: Request):
     try:
+        identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+        proposal = next((item for item in list_policy_proposals() if item.get("proposal_id") == proposal_id), None)
+        if not proposal or not await task_runtime.get_scoped(proposal.get("session_id", ""), identity_scope(identity)):
+            raise HTTPException(status_code=404, detail="策略建议不存在或无权访问")
         return reject_policy_proposal(proposal_id)
     except ValueError as error:
         return {"error": str(error)}
@@ -298,81 +374,58 @@ async def upload_files(files: List[UploadFile] = File(...), thread_id: str = For
 
 
 @app.get("/api/download")
-async def download_file(path: str):
+async def download_file(conversation_id: str, filename: str, http_request: Request):
     """
     文件下载接口 (File Download)。
 
     目标：
-    1. 根据绝对路径下载文件。
-    2. 严格的安全检查，防止越权访问。
-
-    Args:
-        path (str): 文件的绝对路径 (通常从 list_files 接口获取)。
+    1. 只允许下载当前 conversation 工作目录下的文件。
+    2. 先用 task_runtime 元数据确认 conversation 属于当前 tenant/user/shop。
+    3. 不再接受前端传任意绝对路径，避免跨租户猜路径下载 output/session_xxx 文件。
     """
-    # 1. [安全检查] 路径解析与越权校验
     try:
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
-
-        # 必须确保请求的文件在 output 目录下
-        if not abs_path.is_relative_to(output_abs):
-            return {"error": "拒绝访问: 只能下载输出目录下的文件"}
-    except Exception:
-        return {"error": "无效的路径参数"}
-    # 2. [存在性检查]
+        identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+        await ensure_conversation_access(conversation_id, identity)
+        abs_path = resolve_session_file(conversation_id, filename)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     if not abs_path.exists():
-        return {"error": "文件不存在"}
+        raise HTTPException(status_code=404, detail="文件不存在")
 
-    # 3. [响应] 返回文件流 (浏览器自动触发下载)
     return FileResponse(abs_path, filename=abs_path.name)
 
 
 @app.get("/api/files")
-async def list_files(path: str):
+async def list_files(conversation_id: str, http_request: Request):
     """
     文件列表查询接口 (File Explorer)。
 
     目标：
-    1. 列出指定目录下的所有生成文件。
-    2. 提供文件元数据（大小、时间、下载链接）。
-    3. 严格的安全检查，防止路径遍历攻击。
-
-    Args:
-        path (str): 目标目录的绝对路径 (必须在 output 目录下)。
+    1. 通过 conversation_id 定位 output/session_{conversation_id}。
+    2. 先确认该 conversation 属于当前网关注入的 tenant/user/shop。
+    3. 返回会话内相对 filename，不再把服务器绝对路径交给前端。
     """
-    # 1. [调试] 打印请求路径
-    print(f"[DEBUG] 请求文件列表: {path}")
-
     try:
-        # 2. [解析] 获取绝对路径对象
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
+        identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+        await ensure_conversation_access(conversation_id, identity)
+        abs_path = session_dir_for(conversation_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
-        # 3. [安全] 检查路径是否越界 (Path Traversal Check)
-        if not abs_path.is_relative_to(output_abs):
-            print(f"[ERROR] 拒绝访问: {abs_path} 不在 {output_abs} 目录下")
-            return {"error": "拒绝访问: 只能访问输出目录下的文件"}
-
-    except Exception as e:
-        print(f"[ERROR] 路径解析失败: {e}")
-        return {"error": f"路径无效: {e}"}
-
-    # 4. [检查] 目录是否存在
     if not abs_path.exists():
-        return {"error": "目录不存在"}
+        return {"files": []}
 
     files = []
     try:
         # 5. [遍历] 递归查找所有文件
         for file_path in abs_path.rglob("*"):
             if file_path.is_file():
-                # 计算相对路径，生成下载 URL
                 stat = file_path.stat()
+                filename = file_path.relative_to(abs_path).as_posix()
                 files.append({
                     "name": file_path.name,
                     "type": "file",
-                    "path": str(file_path),
-                    # "url": f"/outputs/{url_path}",
+                    "filename": filename,
                     "size": stat.st_size,
                     "mtime": stat.st_mtime
                 })

@@ -49,8 +49,7 @@ const inputQuery = ref('')
 const messages = ref<Message[]>([])
 const status = ref<'idle' | 'running'>('idle')
 const socket = ref<WebSocket | null>(null)
-const currentSessionPath = ref('')
-const currentSessionUrl = ref('')
+const hasSessionFiles = ref(false)
 const messagesEndRef = ref<HTMLElement | null>(null)
 const isWelcomeScreen = computed(() => messages.value.length === 0)
 const isSidebarOpen = ref(false)
@@ -60,6 +59,61 @@ const resumeInstruction = ref('')
 const currentThreadId = ref(crypto.randomUUID())
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
 const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
+const authToken = ref(localStorage.getItem('gateway_access_token') ?? '')
+const tenantId = ref(localStorage.getItem('gateway_tenant_id') ?? 'tenant_demo')
+const shopId = ref(localStorage.getItem('gateway_shop_id') ?? 'default_shop')
+const loginUsername = ref(localStorage.getItem('gateway_username') ?? 'local_user')
+const loginPassword = ref('admin123')
+const loginError = ref('')
+const isAuthenticated = computed(() => authToken.value.length > 0)
+
+const authHeaders = () => ({
+  Authorization: `Bearer ${authToken.value}`,
+  'X-Tenant-ID': tenantId.value,
+  'X-Shop-ID': shopId.value
+})
+
+const authorizedUrl = (path: string, params: Record<string, string>) => {
+  const query = new URLSearchParams({
+    ...params,
+    token: authToken.value,
+    tenant_id: tenantId.value,
+    shop_id: shopId.value
+  })
+  return `${API_BASE_URL}${path}?${query.toString()}`
+}
+
+const persistTenantContext = () => {
+  localStorage.setItem('gateway_tenant_id', tenantId.value)
+  localStorage.setItem('gateway_shop_id', shopId.value)
+}
+
+const login = async () => {
+  loginError.value = ''
+  try {
+    const res = await axios.post(`${API_BASE_URL}/api/v1/auth/login`, {
+      username: loginUsername.value,
+      password: loginPassword.value
+    })
+    authToken.value = res.data.access_token
+    tenantId.value = res.data.user?.default_tenant_id || tenantId.value
+    shopId.value = res.data.user?.default_shop_id || shopId.value
+    localStorage.setItem('gateway_access_token', authToken.value)
+    localStorage.setItem('gateway_tenant_id', tenantId.value)
+    localStorage.setItem('gateway_shop_id', shopId.value)
+    localStorage.setItem('gateway_username', loginUsername.value)
+    connectWebSocket()
+  } catch (error: any) {
+    loginError.value = error.response?.data?.error?.message || error.message || '登录失败'
+  }
+}
+
+const logout = () => {
+  socket.value?.close()
+  socket.value = null
+  authToken.value = ''
+  localStorage.removeItem('gateway_access_token')
+}
 
 const todayBriefs = [
   { label: '昨日经营日报', value: '待生成' },
@@ -158,16 +212,17 @@ const scrollToBottom = async () => {
 
 // Fetch Files
 const fetchFiles = async () => {
-  if (!currentSessionPath.value) return
+  if (!hasSessionFiles.value || !isAuthenticated.value) return
   try {
-    const res = await axios.get(`${API_BASE_URL}/api/files`, {
-      params: { path: currentSessionPath.value }
+    const res = await axios.get(`${API_BASE_URL}/api/v1/files`, {
+      params: { conversation_id: currentThreadId.value },
+      headers: authHeaders()
     })
     if (res.data.files) {
       fileList.value = res.data.files.map((f: any) => ({
         ...f,
-        // 使用新的下载 API，传入绝对路径
-        url: `${API_BASE_URL}/api/download?path=${encodeURIComponent(f.path)}`
+        // 下载只传 conversation_id + filename，后端会按当前网关身份校验文件归属。
+        url: authorizedUrl('/api/v1/download', { conversation_id: currentThreadId.value, filename: f.filename })
       }))
     }
   } catch (e) {
@@ -177,7 +232,15 @@ const fetchFiles = async () => {
 
 // WebSocket Connection
 const connectWebSocket = () => {
-  const ws = new WebSocket(`${WS_BASE_URL}/ws/${currentThreadId.value}`)
+  if (!isAuthenticated.value) return
+  persistTenantContext()
+  socket.value?.close()
+  const query = new URLSearchParams({
+    token: authToken.value,
+    tenant_id: tenantId.value,
+    shop_id: shopId.value
+  })
+  const ws = new WebSocket(`${WS_BASE_URL}/api/v1/ws/${currentThreadId.value}?${query.toString()}`)
 
   ws.onopen = () => {
     console.log('WebSocket Connected')
@@ -194,7 +257,9 @@ const connectWebSocket = () => {
 
   ws.onclose = () => {
     console.log('WebSocket Disconnected, retrying in 3s...')
-    setTimeout(connectWebSocket, 3000)
+    if (isAuthenticated.value) {
+      setTimeout(connectWebSocket, 3000)
+    }
   }
 
   socket.value = ws
@@ -209,16 +274,12 @@ const handleSocketMessage = (data: any) => {
   let lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai')
   
   if (event === 'session_created') {
-    currentSessionPath.value = eventData.path
-    const parts = eventData.path.split(/output[\\/]/)
-    if (parts.length > 1) {
-      currentSessionUrl.value = `${API_BASE_URL}/outputs/${parts[1].replace(/\\/g, '/')}`
-    }
+    hasSessionFiles.value = true
     isSidebarOpen.value = true
     fetchFiles()
   } else if (event === 'tool_start') {
     // 触发文件列表刷新，以确保用户能看到生成的文件
-    if (currentSessionPath.value) {
+    if (hasSessionFiles.value) {
       // 延迟一点刷新，因为工具刚开始运行，文件可能还没生成
       // 但如果是“写入文件”类工具，可能很快就有了
       // 这里可以尝试立即刷新 + 延迟刷新
@@ -235,9 +296,9 @@ const handleSocketMessage = (data: any) => {
         timestamp: new Date().toLocaleTimeString()
       })
       
-      if (eventData.args && eventData.args.filename && currentSessionUrl.value) {
+      if (eventData.args && eventData.args.filename) {
         if (!lastAiMsg.files) lastAiMsg.files = []
-        const fileUrl = `${currentSessionUrl.value}/${eventData.args.filename}`
+        const fileUrl = authorizedUrl('/api/v1/download', { conversation_id: currentThreadId.value, filename: eventData.args.filename })
         // Avoid duplicates
         if (!lastAiMsg.files.find(f => f.name === eventData.args.filename)) {
            lastAiMsg.files.push({
@@ -250,7 +311,7 @@ const handleSocketMessage = (data: any) => {
     }
   } else if (event === 'assistant_call') {
     // 同样刷新文件列表
-    if (currentSessionPath.value) {
+    if (hasSessionFiles.value) {
         fetchFiles()
     }
      if (lastAiMsg) {
@@ -315,13 +376,15 @@ const handleSocketMessage = (data: any) => {
 
 const resumeTask = async (decision: 'continue' | 'revise' | 'abort') => {
   const lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai' && m.interrupt)
-  if (!lastAiMsg || status.value === 'running') return
+  if (!lastAiMsg || status.value === 'running' || !isAuthenticated.value) return
 
   try {
     status.value = 'running'
-    await axios.post(`${API_BASE_URL}/api/task/${currentThreadId.value}/resume`, {
+    await axios.post(`${API_BASE_URL}/api/v1/tasks/${currentThreadId.value}/resume`, {
       decision,
       instruction: resumeInstruction.value
+    }, {
+      headers: authHeaders()
     })
     if (!lastAiMsg.logs) lastAiMsg.logs = []
     lastAiMsg.logs.push({
@@ -345,6 +408,14 @@ const resumeTask = async (decision: 'continue' | 'revise' | 'abort') => {
 // Send Message
 const sendMessage = async () => {
   if ((!inputQuery.value.trim() && selectedFiles.value.length === 0) || status.value === 'running') return
+  if (!isAuthenticated.value) {
+    messages.value.push({
+      role: 'system',
+      content: '请先登录网关，再提交任务。',
+      timestamp: Date.now()
+    })
+    return
+  }
 
   const query = inputQuery.value
   inputQuery.value = ''
@@ -401,9 +472,10 @@ const sendMessage = async () => {
             formData.append('files', file)
         })
 
-        await axios.post(`${API_BASE_URL}/api/upload`, formData, {
+        await axios.post(`${API_BASE_URL}/api/v1/uploads`, formData, {
             headers: {
-                'Content-Type': 'multipart/form-data'
+            'Content-Type': 'multipart/form-data',
+            ...authHeaders()
             }
         })
         
@@ -440,7 +512,9 @@ const sendMessage = async () => {
       payload.thread_id = currentThreadId.value
     }
     console.log('Sending request payload:', payload)
-    const res = await axios.post(`${API_BASE_URL}/api/task`, payload)
+    const res = await axios.post(`${API_BASE_URL}/api/v1/tasks`, payload, {
+      headers: authHeaders()
+    })
     
     if (res.data && res.data.thread_id) {
       currentThreadId.value = res.data.thread_id
@@ -491,7 +565,9 @@ const renderMarkdown = (text: string) => {
 }
 
 onMounted(() => {
-  connectWebSocket()
+  if (isAuthenticated.value) {
+    connectWebSocket()
+  }
 })
 </script>
 
@@ -499,10 +575,24 @@ onMounted(() => {
   <div class="app-container">
     <!-- Main Content -->
     <main class="main-content" :class="{ 'centered-layout': isWelcomeScreen }">
+      <section class="auth-strip">
+        <div class="auth-fields" v-if="!isAuthenticated">
+          <input v-model="loginUsername" placeholder="用户 ID" />
+          <input v-model="loginPassword" type="password" placeholder="密码" @keydown.enter="login" />
+          <button @click="login">登录网关</button>
+          <span v-if="loginError" class="auth-error">{{ loginError }}</span>
+        </div>
+        <div class="auth-fields" v-else>
+          <span class="auth-badge">{{ loginUsername }} / {{ tenantId }} / {{ shopId }}</span>
+          <input v-model="tenantId" placeholder="tenant_id" @change="connectWebSocket" />
+          <input v-model="shopId" placeholder="shop_id" @change="connectWebSocket" />
+          <button @click="logout">退出</button>
+        </div>
+      </section>
       
       <!-- Sidebar Toggle Button -->
       <button 
-        v-if="currentSessionPath && !isSidebarOpen" 
+        v-if="hasSessionFiles && !isSidebarOpen"
         class="sidebar-toggle-btn" 
         @click="isSidebarOpen = true"
         title="Open File Sidebar"
@@ -663,7 +753,7 @@ onMounted(() => {
             placeholder="输入电商运营任务，例如：生成昨日店铺经营日报"
             :disabled="status === 'running'"
           ></textarea>
-          <button class="send-btn" @click="sendMessage" :disabled="!inputQuery.trim() && status !== 'running'">
+          <button class="send-btn" @click="sendMessage" :disabled="!isAuthenticated || (!inputQuery.trim() && status !== 'running')">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
               <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path>
             </svg>
@@ -739,6 +829,61 @@ body {
   position: relative;
   background-color: var(--bg-dark);
   min-width: 0; /* Prevent flex overflow */
+}
+
+.auth-strip {
+  width: 100%;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.75rem 1rem 0;
+  box-sizing: border-box;
+  z-index: 20;
+}
+
+.auth-fields {
+  max-width: 920px;
+  width: min(920px, calc(100% - 24px));
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem;
+  border: 1px solid rgba(155, 209, 111, 0.18);
+  border-radius: 10px;
+  background: rgba(27, 31, 25, 0.88);
+}
+
+.auth-fields input {
+  min-width: 150px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(17, 19, 15, 0.82);
+  color: var(--text-primary);
+  padding: 0.55rem 0.7rem;
+  outline: none;
+}
+
+.auth-fields button {
+  border: 1px solid rgba(155, 209, 111, 0.38);
+  border-radius: 8px;
+  background: rgba(155, 209, 111, 0.14);
+  color: var(--text-primary);
+  padding: 0.55rem 0.85rem;
+  cursor: pointer;
+}
+
+.auth-badge {
+  color: var(--accent-blue);
+  font-size: 0.86rem;
+  font-weight: 700;
+  padding: 0 0.35rem;
+}
+
+.auth-error {
+  color: #ff8a8a;
+  font-size: 0.84rem;
 }
 
 .sidebar-toggle-btn {
