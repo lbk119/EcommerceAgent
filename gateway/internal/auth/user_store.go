@@ -4,7 +4,9 @@ import (
 	"crypto/subtle"
 	"errors"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // User 是网关本地开发阶段持有的用户身份记录。
@@ -13,6 +15,12 @@ import (
 type User struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
+	Email           string   `json:"email"`
+	Phone           string   `json:"phone"`
+	CompanyName     string   `json:"company_name"`
+	Plan            string   `json:"plan"`
+	CreatedAt       string   `json:"created_at"`
+	OnboardingDone  bool     `json:"onboarding_completed"`
 	Password        string   `json:"-"`
 	TenantIDs       []string `json:"tenant_ids"`
 	DefaultTenantID string   `json:"default_tenant_id"`
@@ -28,10 +36,44 @@ type User struct {
 type UserStore interface {
 	Authenticate(username string, password string) (User, error)
 	FindByID(userID string) (User, bool)
+	Register(input RegisterInput) (User, error)
+	AddShop(userID string, tenantID string, shopID string) (User, error)
+	UpdateProfile(userID string, input ProfileInput) (User, error)
+	UpdatePassword(userID string, currentPassword string, newPassword string) error
+	SetOnboardingCompleted(userID string, completed bool) (User, error)
+}
+
+type RegisterInput struct {
+	UserID      string
+	Name        string
+	Email       string
+	Phone       string
+	CompanyName string
+	Plan        string
+	Password    string
+	TenantID    string
+	TenantName  string
+	ShopID      string
+	ShopName    string
+}
+
+type ProfileInput struct {
+	Name        string
+	Email       string
+	Phone       string
+	CompanyName string
 }
 
 type StaticUserStore struct {
+	mu    sync.RWMutex
 	users map[string]User
+}
+
+func NewUserStoreFromConfig(backend string) (UserStore, error) {
+	if backend == "" || strings.EqualFold(backend, "static") {
+		return NewStaticUserStore(), nil
+	}
+	return newMySQLUserStoreFromEnv()
 }
 
 func NewStaticUserStore() *StaticUserStore {
@@ -47,6 +89,11 @@ func NewStaticUserStore() *StaticUserStore {
 	user := User{
 		ID:              userID,
 		Name:            envOrDefault("GATEWAY_DEMO_USER_NAME", "本地管理员"),
+		Email:           envOrDefault("GATEWAY_DEMO_USER_EMAIL", "operator@example.com"),
+		CompanyName:     envOrDefault("GATEWAY_DEMO_COMPANY_NAME", "EcomPilot 示例公司"),
+		Plan:            envOrDefault("GATEWAY_DEMO_PLAN", "团队版"),
+		CreatedAt:       "本地开发",
+		OnboardingDone:  true,
 		Password:        password,
 		TenantIDs:       splitCSV(envOrDefault("GATEWAY_DEMO_TENANT_IDS", defaultTenant)),
 		DefaultTenantID: defaultTenant,
@@ -60,7 +107,18 @@ func NewStaticUserStore() *StaticUserStore {
 }
 
 func (s *StaticUserStore) Authenticate(username string, password string) (User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	user, ok := s.users[username]
+	if !ok {
+		for _, candidate := range s.users {
+			if strings.EqualFold(candidate.Email, strings.TrimSpace(username)) {
+				user = candidate
+				ok = true
+				break
+			}
+		}
+	}
 	if !ok {
 		return User{}, errors.New("invalid credentials")
 	}
@@ -71,8 +129,130 @@ func (s *StaticUserStore) Authenticate(username string, password string) (User, 
 }
 
 func (s *StaticUserStore) FindByID(userID string) (User, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	user, ok := s.users[userID]
 	return user, ok
+}
+
+func (s *StaticUserStore) Register(input RegisterInput) (User, error) {
+	userID := normalizeIdentifier(firstNonEmpty(input.UserID, input.Email))
+	if userID == "" {
+		return User{}, errors.New("user id required")
+	}
+	if strings.TrimSpace(input.Password) == "" {
+		return User{}, errors.New("password required")
+	}
+	tenantID := normalizeIdentifier(input.TenantID)
+	if tenantID == "" {
+		tenantID = normalizeIdentifier(input.TenantName)
+	}
+	if tenantID == "" {
+		tenantID = userID + "_org"
+	}
+	shopID := normalizeIdentifier(input.ShopID)
+	if shopID == "" {
+		shopID = normalizeIdentifier(input.ShopName)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.users[userID]; exists {
+		return User{}, errors.New("user already exists")
+	}
+	user := User{
+		ID:              userID,
+		Name:            firstNonEmpty(input.Name, userID),
+		Email:           firstNonEmpty(input.Email, input.UserID),
+		Phone:           input.Phone,
+		CompanyName:     firstNonEmpty(input.CompanyName, input.TenantName, tenantID),
+		Plan:            firstNonEmpty(input.Plan, "团队版"),
+		CreatedAt:       "刚刚",
+		OnboardingDone:  shopID != "",
+		Password:        input.Password,
+		TenantIDs:       []string{tenantID},
+		DefaultTenantID: tenantID,
+		ShopIDs:         []string{},
+		DefaultShopID:   "",
+		Roles:           []string{"admin"},
+		Permissions:     splitCSV(envOrDefault("GATEWAY_DEMO_PERMISSIONS", "task:create,task:read,task:cancel,task:resume,file:upload,file:download,file:list,memory:read,memory:review,memory:approve,memory:reject,policy:read,policy:approve,policy:reject,trace:read,metrics:read,tool:database:read,tool:network:search,tool:kb:ask")),
+	}
+	if shopID != "" {
+		user.ShopIDs = []string{shopID}
+		user.DefaultShopID = shopID
+	}
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *StaticUserStore) AddShop(userID string, tenantID string, shopID string) (User, error) {
+	shopID = normalizeIdentifier(shopID)
+	if shopID == "" {
+		return User{}, errors.New("shop id required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[userID]
+	if !ok {
+		return User{}, errors.New("user not found")
+	}
+	if tenantID != "" && !contains(user.TenantIDs, tenantID) {
+		return User{}, errors.New("tenant forbidden")
+	}
+	if !contains(user.ShopIDs, shopID) {
+		user.ShopIDs = append(user.ShopIDs, shopID)
+	}
+	if user.DefaultShopID == "" {
+		user.DefaultShopID = shopID
+	}
+	user.OnboardingDone = true
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *StaticUserStore) UpdateProfile(userID string, input ProfileInput) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[userID]
+	if !ok {
+		return User{}, errors.New("user not found")
+	}
+	user.Name = firstNonEmpty(input.Name, user.Name)
+	user.Email = firstNonEmpty(input.Email, user.Email)
+	user.Phone = firstNonEmpty(input.Phone, user.Phone)
+	user.CompanyName = firstNonEmpty(input.CompanyName, user.CompanyName)
+	s.users[userID] = user
+	return user, nil
+}
+
+func (s *StaticUserStore) UpdatePassword(userID string, currentPassword string, newPassword string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[userID]
+	if !ok {
+		return errors.New("user not found")
+	}
+	if subtle.ConstantTimeCompare([]byte(user.Password), []byte(currentPassword)) != 1 {
+		return errors.New("invalid credentials")
+	}
+	if strings.TrimSpace(newPassword) == "" {
+		return errors.New("password required")
+	}
+	user.Password = newPassword
+	s.users[userID] = user
+	return nil
+}
+
+func (s *StaticUserStore) SetOnboardingCompleted(userID string, completed bool) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[userID]
+	if !ok {
+		return User{}, errors.New("user not found")
+	}
+	user.OnboardingDone = completed
+	s.users[userID] = user
+	return user, nil
 }
 
 func splitCSV(value string) []string {
@@ -92,4 +272,33 @@ func envOrDefault(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func normalizeIdentifier(value string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(value))
+	if trimmed == "" {
+		return ""
+	}
+	replacer := regexp.MustCompile(`[^\p{L}\p{N}_\-]+`)
+	normalized := replacer.ReplaceAllString(trimmed, "_")
+	return strings.Trim(normalized, "_-")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

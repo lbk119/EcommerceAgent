@@ -17,8 +17,29 @@ def semantic_memory_enabled() -> bool:
     return os.getenv("MEMORY_VECTOR_BACKEND", "milvus").lower() == "milvus"
 
 
+def vector_search_enabled() -> bool:
+    """
+    控制“任务前置召回”是否启用 Milvus/BGE 向量检索。
+
+    本地 BGE/部分向量依赖可能在底层原生库初始化失败时直接终止 Python 进程，普通 try/except 捕获不到。
+    因此读路径默认关闭，必须显式设置 MEMORY_VECTOR_SEARCH_ENABLED=true 才会进入向量召回；
+    未开启时仍会使用 MySQL 记忆检索兜底，保证 Agent 主流程不被可选增强能力拖垮。
+    """
+    return os.getenv("MEMORY_VECTOR_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def vector_write_enabled() -> bool:
+    """
+    控制任务结束后的向量索引写入。
+
+    写路径同样默认关闭，避免任务已经产出结果后，因为 embedding/Milvus 本地环境异常导致进程退出。
+    生产环境确认 BGE/Milvus 稳定后，再通过 MEMORY_VECTOR_WRITE_ENABLED=true 打开。
+    """
+    return os.getenv("MEMORY_VECTOR_WRITE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
 def index_memory_embedding(identity: MemoryIdentity, memory_id: str, candidate: MemoryCandidate) -> None:
-    if not semantic_memory_enabled():
+    if not semantic_memory_enabled() or not vector_write_enabled():
         return
     try:
         embedding_text = _embedding_text(candidate)
@@ -30,7 +51,7 @@ def index_memory_embedding(identity: MemoryIdentity, memory_id: str, candidate: 
 
 
 def search_memory_embeddings(identity: MemoryIdentity, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    if not semantic_memory_enabled() or not query.strip():
+    if not semantic_memory_enabled() or not vector_search_enabled() or not query.strip():
         return []
     try:
         vector = embed_text(query)
@@ -81,8 +102,8 @@ def _get_collection():
     alias = "ecommerce_memory"
     host = os.getenv("MILVUS_HOST", "localhost")
     port = os.getenv("MILVUS_PORT", "19530")
-    user = os.getenv("MILVUS_USER") or ""
-    password = os.getenv("MILVUS_PASSWORD") or ""
+    user = os.getenv("MILVUS_USER") or "admin"
+    password = os.getenv("MILVUS_PASSWORD") or "admin"
     database = os.getenv("MILVUS_DATABASE") or "default"
     collection_name = os.getenv("MEMORY_MILVUS_COLLECTION", "agent_memories")
     kwargs = {"alias": alias, "host": host, "port": port, "db_name": database}

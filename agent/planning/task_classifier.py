@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 
-TASK_TYPES = {"daily_report", "inventory_analysis", "campaign_review", "refund_analysis", "general_chat"}
+TASK_TYPES = {"daily_report", "inventory_analysis", "campaign_review", "refund_analysis", "hot_product_analysis", "general_chat"}
 RISK_LEVELS = {"low", "medium", "high"}
 WORKFLOWS = {"deepagent", "deterministic_dag"}
 
@@ -46,6 +46,9 @@ def classify_task(query: str) -> TaskClassification:
     执行失败时再回落 DeepAgent。
     """
     compact_query = _compact(query)
+    if _contains_any(compact_query, _HOT_PRODUCT_KEYWORDS):
+        return TaskClassification("hot_product_analysis", "medium", True, "deterministic_dag")
+
     matched_type = _first_matching_type(compact_query)
 
     if matched_type == "daily_report":
@@ -84,4 +87,16 @@ _TASK_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("inventory_analysis", ("库存", "补货", "安全库存", "缺货", "滞销", "inventory")),
     ("campaign_review", ("活动复盘", "投放复盘", "roi", "转化率", "campaign")),
     ("refund_analysis", ("退款", "退款率", "客诉", "异常分析", "refund")),
+)
+
+
+_HOT_PRODUCT_KEYWORDS: Tuple[str, ...] = (
+    "爆品",
+    "热销",
+    "畅销",
+    "表现最好",
+    "销售增长",
+    "放量",
+    "topproduct",
+    "bestseller",
 )

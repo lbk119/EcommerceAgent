@@ -49,6 +49,7 @@ class WorkflowRouter:
         "daily_report": "daily_report",
         "inventory_analysis": "inventory_warning",
         "campaign_review": "campaign_review",
+        "hot_product_analysis": "hot_product_analysis",
     }
 
     def route(self, classification: TaskClassification) -> Optional[WorkflowRoute]:
@@ -129,6 +130,8 @@ class WorkflowRunner:
             return await self._run_inventory_warning(query, trace_id, task_id, conversation_id)
         if workflow_name == "campaign_review":
             return await self._run_campaign_review(query, trace_id, task_id, conversation_id)
+        if workflow_name == "hot_product_analysis":
+            return await self._run_hot_product_analysis(query, trace_id, task_id, conversation_id)
         raise ValueError(f"未知 workflow: {workflow_name}")
 
     async def _run_daily_report(self, query: str, trace_id: str, task_id: str, conversation_id: str) -> ExecutionResult:
@@ -173,6 +176,19 @@ class WorkflowRunner:
         output_requirements = "输出活动复盘，必须覆盖曝光、点击、转化、GMV、退款或 ROI，并给出下一轮优化动作；如节点结果包含 section_error，必须明确说明该部分缺失，不能编造。"
         content = await self._synthesize(workflow=workflow, query=query, sections=sections, output_requirements=output_requirements)
         return ExecutionResult(content=content, source="workflow", workflow_name="campaign_review", sections=sections, time_range=time_range.to_metadata(), workflow_definition=workflow, output_requirements=output_requirements)
+
+    async def _run_hot_product_analysis(self, query: str, trace_id: str, task_id: str, conversation_id: str) -> ExecutionResult:
+        from agent.workflows.hot_product_analysis import describe_hot_product_workflow
+
+        from agent.workflows.business_metrics import parse_business_time_range, query_hot_products
+
+        time_range = parse_business_time_range(query)
+        hot_products = await self._run_metric_step(trace_id, task_id, conversation_id, "爆品综合指标查询", lambda: query_hot_products(time_range, limit=5), required=True, time_range_label=time_range.label)
+        sections = {"爆品候选指标": hot_products}
+        workflow = describe_hot_product_workflow()
+        output_requirements = "输出爆品分析结论，必须覆盖销售增长、流量、转化、价格、库存、活动 ROI、退款风险和下一步放量建议；只能基于节点结果给出 TOP 候选，不要再次调用数据库助手。"
+        content = await self._synthesize(workflow=workflow, query=query, sections=sections, output_requirements=output_requirements)
+        return ExecutionResult(content=content, source="workflow", workflow_name="hot_product_analysis", sections=sections, time_range=time_range.to_metadata(), workflow_definition=workflow, output_requirements=output_requirements)
 
     async def resynthesize_from_result(self, query: str, execution_result: ExecutionResult, fix_instruction: str) -> str:
         """基于 workflow 原始节点结果重新综合，用于 Critic 修正，避免回到自由 DeepAgent。"""

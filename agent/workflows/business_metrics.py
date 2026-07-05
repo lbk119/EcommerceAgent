@@ -8,7 +8,7 @@
 from dataclasses import dataclass
 import re
 
-from agent.core.db import execute_read_sql_raw
+from agent.core.db import current_data_scope_sql, execute_read_sql_raw
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,10 @@ def query_daily_metrics(time_range: BusinessTimeRange | None = None) -> str:
     默认最近 30 天；如果用户 query 解析出今天、昨天、本周或最近 N 天，则使用对应时间窗口。
     """
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    data_scope = _required_data_scope("o")
+    item_scope = _required_data_scope("oi")
+    review_scope = _required_data_scope("r")
+    refund_scope = _required_data_scope("rf")
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     refund_filter = _time_filter("rf.refund_time", "b.max_time", time_range)
     return execute_read_sql_raw(f"""
@@ -82,6 +86,8 @@ WITH bounds AS (
     JOIN order_items oi ON oi.order_id = o.order_id
     CROSS JOIN bounds b
     WHERE o.order_status IN ('delivered', 'shipped', 'invoiced', 'approved')
+            AND {data_scope}
+            AND {item_scope}
             AND {order_filter}
 ), reviews_30d AS (
     SELECT
@@ -90,14 +96,17 @@ WITH bounds AS (
     FROM reviews r
     JOIN orders o ON o.order_id = r.order_id
     CROSS JOIN bounds b
-    WHERE {order_filter}
+    WHERE {review_scope}
+            AND {data_scope}
+            AND {order_filter}
 ), refunds_30d AS (
     SELECT
         COUNT(*) AS refund_count,
         ROUND(SUM(refund_amount), 2) AS refund_amount
     FROM refunds rf
     CROSS JOIN bounds b
-    WHERE {refund_filter}
+    WHERE {refund_scope}
+            AND {refund_filter}
 )
 SELECT
     COALESCE(s.orders_count, 0) AS orders_count,
@@ -118,6 +127,11 @@ CROSS JOIN refunds_30d rf
 def query_daily_risks(time_range: BusinessTimeRange | None = None) -> str:
     """查询日报需要关注的经营风险：低库存、差评、退款和客服问题。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    data_scope = _required_data_scope("o")
+    inventory_scope = _required_data_scope("inventory")
+    review_scope = _required_data_scope("r")
+    refund_scope = _required_data_scope("rf")
+    ticket_scope = _required_data_scope("t")
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     refund_filter = _time_filter("rf.refund_time", "b.max_time", time_range)
     ticket_filter = _time_filter("t.ticket_time", "b.max_time", time_range)
@@ -127,19 +141,23 @@ WITH bounds AS (
 ), low_inventory AS (
     SELECT COUNT(*) AS low_inventory_products
     FROM inventory
-    WHERE stock <= safety_stock
+    WHERE {inventory_scope}
+            AND stock <= safety_stock
 ), bad_reviews AS (
     SELECT COUNT(*) AS bad_review_count
     FROM reviews r
     JOIN orders o ON o.order_id = r.order_id
     CROSS JOIN bounds b
     WHERE r.review_score <= 2
+            AND {review_scope}
+            AND {data_scope}
             AND {order_filter}
 ), refund_reasons AS (
     SELECT refund_reason, COUNT(*) AS refund_count
     FROM refunds rf
     CROSS JOIN bounds b
-    WHERE {refund_filter}
+        WHERE {refund_scope}
+            AND {refund_filter}
     GROUP BY refund_reason
     ORDER BY refund_count DESC
     LIMIT 3
@@ -147,7 +165,8 @@ WITH bounds AS (
     SELECT issue_type, COUNT(*) AS ticket_count
     FROM customer_service_tickets t
     CROSS JOIN bounds b
-    WHERE {ticket_filter}
+        WHERE {ticket_scope}
+            AND {ticket_filter}
     GROUP BY issue_type
     ORDER BY ticket_count DESC
     LIMIT 3
@@ -165,6 +184,10 @@ SELECT CONCAT('top_service_issue:', issue_type), CAST(ticket_count AS CHAR) FROM
 def query_inventory_risks(time_range: BusinessTimeRange | None = None) -> str:
     """查询库存预警的风险 SKU，固定覆盖低库存、缺货和滞销信号。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    data_scope = _required_data_scope("o")
+    item_scope = _required_data_scope("oi")
+    inventory_scope = _required_data_scope("i")
+    product_scope = _required_data_scope("p")
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     return execute_read_sql_raw(f"""
 WITH bounds AS (
@@ -178,6 +201,8 @@ WITH bounds AS (
     JOIN orders o ON o.order_id = oi.order_id
         CROSS JOIN bounds b
     WHERE o.order_status IN ('delivered', 'shipped', 'invoiced', 'approved')
+            AND {data_scope}
+            AND {item_scope}
             AND {order_filter}
     GROUP BY oi.product_id
 )
@@ -197,9 +222,11 @@ SELECT
 FROM inventory i
 JOIN products p ON p.product_id = i.product_id
 LEFT JOIN recent_sales rs ON rs.product_id = i.product_id
-WHERE i.stock <= i.safety_stock
-   OR i.stock <= 0
-   OR (COALESCE(rs.units_sold_30d, 0) = 0 AND i.stock > i.safety_stock)
+WHERE {inventory_scope}
+    AND {product_scope}
+    AND (i.stock <= i.safety_stock
+          OR i.stock <= 0
+          OR (COALESCE(rs.units_sold_30d, 0) = 0 AND i.stock > i.safety_stock))
 ORDER BY
     CASE
         WHEN i.stock <= 0 THEN 1
@@ -214,6 +241,10 @@ LIMIT 20
 def query_inventory_velocity(time_range: BusinessTimeRange | None = None) -> str:
     """查询补货判断需要的销量速度、安全库存和建议补货量。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    data_scope = _required_data_scope("o")
+    item_scope = _required_data_scope("oi")
+    inventory_scope = _required_data_scope("i")
+    product_scope = _required_data_scope("p")
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     return execute_read_sql_raw(f"""
 WITH bounds AS (
@@ -228,6 +259,8 @@ WITH bounds AS (
     JOIN orders o ON o.order_id = oi.order_id
         CROSS JOIN bounds b
     WHERE o.order_status IN ('delivered', 'shipped', 'invoiced', 'approved')
+            AND {data_scope}
+            AND {item_scope}
             AND {order_filter}
     GROUP BY oi.product_id
 )
@@ -249,6 +282,8 @@ SELECT
 FROM inventory i
 JOIN products p ON p.product_id = i.product_id
 LEFT JOIN sales_30d s ON s.product_id = i.product_id
+WHERE {inventory_scope}
+    AND {product_scope}
 ORDER BY suggested_replenishment DESC, sales_amount_30d DESC
 LIMIT 20
 """)
@@ -258,6 +293,8 @@ def query_campaign_traffic(time_range: BusinessTimeRange | None = None) -> str:
     """查询活动复盘的曝光、点击和 CTR。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
     campaign_filter = _campaign_time_filter(time_range)
+    campaign_scope = _required_data_scope("c")
+    stats_scope = _required_data_scope("cps")
     return execute_read_sql_raw(f"""
 SELECT
     c.campaign_id,
@@ -270,6 +307,8 @@ SELECT
 FROM campaigns c
 JOIN campaign_product_stats cps ON cps.campaign_id = c.campaign_id
 WHERE {campaign_filter}
+    AND {campaign_scope}
+    AND {stats_scope}
 GROUP BY c.campaign_id, c.campaign_name, c.channel, c.status
 ORDER BY impressions DESC
 LIMIT 20
@@ -280,6 +319,8 @@ def query_campaign_roi(time_range: BusinessTimeRange | None = None) -> str:
     """查询活动复盘的转化、GMV、花费和 ROI。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
     campaign_filter = _campaign_time_filter(time_range)
+    campaign_scope = _required_data_scope("c")
+    stats_scope = _required_data_scope("cps")
     return execute_read_sql_raw(f"""
 SELECT
     c.campaign_id,
@@ -293,6 +334,8 @@ SELECT
 FROM campaigns c
 JOIN campaign_product_stats cps ON cps.campaign_id = c.campaign_id
 WHERE {campaign_filter}
+    AND {campaign_scope}
+    AND {stats_scope}
 GROUP BY c.campaign_id, c.campaign_name, c.channel
 ORDER BY roi DESC, revenue DESC
 LIMIT 20
@@ -303,9 +346,18 @@ def query_campaign_risks(time_range: BusinessTimeRange | None = None) -> str:
     """查询活动商品相关退款、库存和差评风险。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
     campaign_filter = _campaign_time_filter(time_range)
+    campaign_scope = _required_data_scope("c")
+    stats_scope = _required_data_scope("campaign_product_stats")
+    product_scope = _required_data_scope("p")
+    inventory_scope = _required_data_scope("i")
+    refund_scope = _required_data_scope("rf")
+    item_scope = _required_data_scope("oi")
+    order_scope = _required_data_scope("o")
+    review_scope = _required_data_scope("r")
     return execute_read_sql_raw(f"""
 WITH campaign_products AS (
     SELECT DISTINCT campaign_id, product_id FROM campaign_product_stats
+    WHERE {stats_scope}
 ), refund_risk AS (
     SELECT
         cp.campaign_id,
@@ -314,6 +366,7 @@ WITH campaign_products AS (
         ROUND(SUM(rf.refund_amount), 2) AS refund_amount
     FROM campaign_products cp
     LEFT JOIN refunds rf ON rf.product_id = cp.product_id
+        AND {refund_scope}
     GROUP BY cp.campaign_id, cp.product_id
 ), review_risk AS (
     SELECT
@@ -322,7 +375,11 @@ WITH campaign_products AS (
         COUNT(CASE WHEN r.review_score <= 2 THEN 1 END) AS bad_review_count
     FROM campaign_products cp
     LEFT JOIN order_items oi ON oi.product_id = cp.product_id
-    LEFT JOIN reviews r ON r.order_id = oi.order_id
+        AND {item_scope}
+    LEFT JOIN orders o ON o.order_id = oi.order_id
+        AND {order_scope}
+    LEFT JOIN reviews r ON r.order_id = o.order_id
+        AND {review_scope}
     GROUP BY cp.campaign_id, cp.product_id
 )
 SELECT
@@ -344,16 +401,146 @@ SELECT
 FROM campaigns c
 JOIN campaign_products cp ON cp.campaign_id = c.campaign_id
 JOIN products p ON p.product_id = cp.product_id
-LEFT JOIN inventory i ON i.product_id = cp.product_id
+LEFT JOIN inventory i ON i.product_id = cp.product_id AND {inventory_scope}
 LEFT JOIN refund_risk rr ON rr.campaign_id = cp.campaign_id AND rr.product_id = cp.product_id
 LEFT JOIN review_risk rv ON rv.campaign_id = cp.campaign_id AND rv.product_id = cp.product_id
 WHERE {campaign_filter}
+    AND {campaign_scope}
+    AND {product_scope}
   AND (i.stock <= i.safety_stock
     OR COALESCE(rr.refund_count, 0) > 0
     OR COALESCE(rv.bad_review_count, 0) > 0)
 ORDER BY COALESCE(rr.refund_amount, 0) DESC, COALESCE(rv.bad_review_count, 0) DESC
 LIMIT 20
 """)
+
+
+def query_hot_products(time_range: BusinessTimeRange | None = None, limit: int = 5) -> str:
+    """
+    查询爆品分析的完整候选指标。
+
+    这个查询是 DeepAgent 自由调库的确定性替代：一次 SQL 覆盖销售、流量、转化、价格、库存、活动和退款，
+    避免主 Agent 因为缺少终止信号而反复调用数据库助手。多租户/多店铺隔离仍由网关注入身份和数据库层
+    后续的店铺字段过滤承接；当前 demo 数据没有真实 shop_id 字段，所以这里只做业务指标聚合。
+    """
+    time_range = time_range or BusinessTimeRange("last_30d", 30)
+    limit = max(1, min(int(limit), 20))
+
+    def run_query(active_time_range: BusinessTimeRange) -> str:
+        order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", active_time_range)
+        traffic_filter = _time_filter("ts.stat_date", "tb.max_time", active_time_range)
+        refund_filter = _time_filter("rf.refund_time", "rb.max_time", active_time_range)
+        order_scope = _required_data_scope("o")
+        item_scope = _required_data_scope("oi")
+        traffic_scope = _required_data_scope("ts")
+        refund_scope = _required_data_scope("rf")
+        campaign_scope = _required_data_scope("campaign_product_stats")
+        product_scope = _required_data_scope("p")
+        inventory_scope = _required_data_scope("i")
+        return execute_read_sql_raw(f"""
+WITH order_bounds AS (
+    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders
+), traffic_bounds AS (
+    SELECT MAX(stat_date) AS max_time FROM traffic_stats
+), refund_bounds AS (
+    SELECT MAX(refund_time) AS max_time FROM refunds
+), sales AS (
+    SELECT
+        oi.product_id,
+        COUNT(DISTINCT o.order_id) AS orders_count,
+        COUNT(*) AS units_sold,
+        ROUND(SUM(oi.price), 2) AS sales_amount,
+        ROUND(AVG(oi.price), 2) AS avg_price,
+        MIN(o.order_purchase_timestamp) AS first_order_time,
+        MAX(o.order_purchase_timestamp) AS last_order_time
+    FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id
+    CROSS JOIN order_bounds b
+    WHERE o.order_status IN ('delivered', 'shipped', 'invoiced', 'approved')
+            AND {order_scope}
+            AND {item_scope}
+      AND {order_filter}
+    GROUP BY oi.product_id
+), traffic AS (
+    SELECT
+        ts.product_id,
+        SUM(ts.views) AS views,
+        SUM(ts.visitors) AS visitors,
+        SUM(ts.add_to_cart) AS add_to_cart,
+        SUM(ts.favorites) AS favorites,
+        SUM(ts.conversions) AS conversions,
+        ROUND(SUM(ts.conversions) / NULLIF(SUM(ts.visitors), 0), 4) AS conversion_rate
+    FROM traffic_stats ts
+    CROSS JOIN traffic_bounds tb
+    WHERE {traffic_filter}
+            AND {traffic_scope}
+    GROUP BY ts.product_id
+), campaign AS (
+    SELECT
+        product_id,
+        SUM(impressions) AS campaign_impressions,
+        SUM(clicks) AS campaign_clicks,
+        SUM(orders_count) AS campaign_orders,
+        ROUND(SUM(revenue), 2) AS campaign_revenue,
+        ROUND(SUM(spend), 2) AS campaign_spend,
+        ROUND(SUM(revenue) / NULLIF(SUM(spend), 0), 2) AS campaign_roi
+    FROM campaign_product_stats
+    WHERE {campaign_scope}
+    GROUP BY product_id
+), refund AS (
+    SELECT
+        rf.product_id,
+        COUNT(*) AS refunds_count,
+        ROUND(SUM(rf.refund_amount), 2) AS refund_amount
+    FROM refunds rf
+    CROSS JOIN refund_bounds rb
+    WHERE {refund_filter}
+            AND {refund_scope}
+    GROUP BY rf.product_id
+)
+SELECT
+    s.product_id,
+    p.category_name_en,
+    s.orders_count,
+    s.units_sold,
+    s.sales_amount,
+    s.avg_price,
+    COALESCE(t.views, 0) AS views,
+    COALESCE(t.visitors, 0) AS visitors,
+    COALESCE(t.conversions, 0) AS conversions,
+    COALESCE(t.conversion_rate, 0) AS conversion_rate,
+    COALESCE(i.stock, 0) AS stock,
+    COALESCE(i.safety_stock, 0) AS safety_stock,
+    COALESCE(c.campaign_impressions, 0) AS campaign_impressions,
+    COALESCE(c.campaign_clicks, 0) AS campaign_clicks,
+    COALESCE(c.campaign_orders, 0) AS campaign_orders,
+    COALESCE(c.campaign_revenue, 0) AS campaign_revenue,
+    COALESCE(c.campaign_spend, 0) AS campaign_spend,
+    COALESCE(c.campaign_roi, 0) AS campaign_roi,
+    COALESCE(r.refunds_count, 0) AS refunds_count,
+    COALESCE(r.refund_amount, 0) AS refund_amount,
+    s.first_order_time,
+    s.last_order_time
+FROM sales s
+JOIN products p ON p.product_id = s.product_id
+LEFT JOIN traffic t ON t.product_id = s.product_id
+LEFT JOIN inventory i ON i.product_id = s.product_id AND {inventory_scope}
+LEFT JOIN campaign c ON c.product_id = s.product_id
+LEFT JOIN refund r ON r.product_id = s.product_id
+WHERE {product_scope}
+ORDER BY s.sales_amount DESC, s.units_sold DESC
+LIMIT {limit}
+""")
+
+    result = run_query(time_range)
+    if len(result.splitlines()) > 1:
+        return result
+
+    # Demo/历史数据的“今天”不一定有足够订单，固定 workflow 不能因为短窗口为空就回落 DeepAgent 反复调库。
+    fallback_result = run_query(BusinessTimeRange("last_365d", 365))
+    if len(fallback_result.splitlines()) > 1:
+        return "请求时间窗口内没有足够订单明细，已自动扩大到最近 365 天业务数据。\n" + fallback_result
+    return fallback_result
 
 
 def _time_filter(column: str, anchor_sql: str, time_range: BusinessTimeRange) -> str:
@@ -367,6 +554,13 @@ def _time_filter(column: str, anchor_sql: str, time_range: BusinessTimeRange) ->
         end_expr = f"DATE_SUB(DATE({anchor_sql}), INTERVAL {time_range.offset_days - 1} DAY)"
         return f"{column} >= {start_expr} AND {column} < {end_expr}"
     return f"{column} >= DATE_SUB({anchor_sql}, INTERVAL {time_range.days} DAY)"
+
+
+def _required_data_scope(alias: str) -> str:
+    scope = current_data_scope_sql(alias)
+    if not scope:
+        raise RuntimeError("缺少可信 tenant/shop 上下文，无法执行经营数据 workflow")
+    return scope
 
 
 def _campaign_time_filter(time_range: BusinessTimeRange) -> str:

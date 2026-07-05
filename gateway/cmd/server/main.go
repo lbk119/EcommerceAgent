@@ -27,18 +27,22 @@ func main() {
 		gin.SetMode(cfg.Mode)
 	}
 
-	userStore := auth.NewStaticUserStore()
+	userStore, err := auth.NewUserStoreFromConfig(cfg.UserStoreBackend)
+	if err != nil {
+		slog.Error("initialize gateway user store", "backend", cfg.UserStoreBackend, "error", err)
+		os.Exit(1)
+	}
 	tokenManager, err := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTExpiresIn)
 	if err != nil {
 		slog.Error("initialize gateway auth", "error", err)
 		os.Exit(1)
 	}
-	authHandler := handlers.NewAuthHandler(userStore, tokenManager)
 	enforcer, err := authorization.NewEnforcer(cfg.CasbinModel, cfg.CasbinPolicy)
 	if err != nil {
 		slog.Error("initialize casbin authorization", "error", err)
 		os.Exit(1)
 	}
+	authHandler := handlers.NewAuthHandler(userStore, tokenManager, enforcer)
 
 	brainProxy := proxy.NewBrainProxy(cfg.PythonBrainURL)
 	engine := router.New(cfg, brainProxy, authHandler, tokenManager, userStore, enforcer)

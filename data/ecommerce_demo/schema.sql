@@ -1,6 +1,9 @@
 CREATE DATABASE IF NOT EXISTS ecommerce_demo CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE ecommerce_demo;
 
+SET @default_tenant_id = 'tenant_demo';
+SET @default_shop_id = 'default_shop';
+
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS customer_service_tickets;
 DROP TABLE IF EXISTS refunds;
@@ -18,6 +21,8 @@ DROP TABLE IF EXISTS customers;
 SET FOREIGN_KEY_CHECKS = 1;
 
 CREATE TABLE customers (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   customer_id VARCHAR(64) PRIMARY KEY,
   customer_unique_id VARCHAR(64),
   customer_zip_code_prefix INT,
@@ -28,6 +33,8 @@ CREATE TABLE customers (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE sellers (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   seller_id VARCHAR(64) PRIMARY KEY,
   seller_zip_code_prefix INT,
   seller_city VARCHAR(128),
@@ -36,6 +43,8 @@ CREATE TABLE sellers (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE products (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   product_id VARCHAR(64) PRIMARY KEY,
   category_name VARCHAR(128),
   category_name_en VARCHAR(128),
@@ -50,6 +59,8 @@ CREATE TABLE products (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE orders (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   order_id VARCHAR(64) PRIMARY KEY,
   customer_id VARCHAR(64),
   order_status VARCHAR(32),
@@ -65,6 +76,8 @@ CREATE TABLE orders (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE order_items (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   order_id VARCHAR(64),
   order_item_id INT,
   product_id VARCHAR(64),
@@ -81,6 +94,8 @@ CREATE TABLE order_items (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE payments (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   order_id VARCHAR(64),
   payment_sequential INT,
   payment_type VARCHAR(64),
@@ -92,6 +107,8 @@ CREATE TABLE payments (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE reviews (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   review_id VARCHAR(64),
   order_id VARCHAR(64),
   review_score INT,
@@ -106,6 +123,8 @@ CREATE TABLE reviews (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE inventory (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   product_id VARCHAR(64) PRIMARY KEY,
   stock INT NOT NULL,
   safety_stock INT NOT NULL,
@@ -116,6 +135,8 @@ CREATE TABLE inventory (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE traffic_stats (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   stat_id BIGINT AUTO_INCREMENT PRIMARY KEY,
   stat_date DATE NOT NULL,
   product_id VARCHAR(64) NOT NULL,
@@ -130,6 +151,8 @@ CREATE TABLE traffic_stats (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE campaigns (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   campaign_id VARCHAR(64) PRIMARY KEY,
   campaign_name VARCHAR(128) NOT NULL,
   channel VARCHAR(64) NOT NULL,
@@ -141,6 +164,8 @@ CREATE TABLE campaigns (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE campaign_product_stats (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   campaign_id VARCHAR(64),
   product_id VARCHAR(64),
   impressions INT NOT NULL,
@@ -155,6 +180,8 @@ CREATE TABLE campaign_product_stats (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE refunds (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   refund_id VARCHAR(64) PRIMARY KEY,
   order_id VARCHAR(64) NOT NULL,
   product_id VARCHAR(64) NOT NULL,
@@ -169,6 +196,8 @@ CREATE TABLE refunds (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE customer_service_tickets (
+  tenant_id VARCHAR(64) NOT NULL DEFAULT 'tenant_demo',
+  shop_id VARCHAR(64) NOT NULL DEFAULT 'default_shop',
   ticket_id VARCHAR(64) PRIMARY KEY,
   order_id VARCHAR(64) NULL,
   product_id VARCHAR(64) NULL,

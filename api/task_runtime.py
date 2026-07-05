@@ -229,6 +229,7 @@ class TaskRuntime:
                     state["error"] = str(error)
                 else:
                     state["status"] = "succeeded"
+                    state["result"] = task.result()
             state["updated_at"] = time.time()
 
 

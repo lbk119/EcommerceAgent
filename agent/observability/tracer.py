@@ -44,6 +44,7 @@ class JsonlTracer:
         try:
             event = TraceEvent(event_type=event_type, **fields)
             self.write(event)
+            self._emit_live_progress(event)
         except Exception:
             self._drop_event()
 
@@ -100,6 +101,99 @@ class JsonlTracer:
     def _drop_event(self) -> None:
         """记录丢弃计数。计数本身只做排障参考，不参与业务判断。"""
         self.dropped_count += 1
+
+    def _emit_live_progress(self, event: TraceEvent) -> None:
+        if not event.conversation_id or event.event_type not in _LIVE_PROGRESS_EVENTS:
+            return
+        try:
+            from api.monitor import monitor
+
+            monitor._emit(
+                event.event_type,
+                _live_progress_message(event),
+                {
+                    "trace_id": event.trace_id,
+                    "task_id": event.task_id,
+                    "conversation_id": event.conversation_id,
+                    "agent_name": event.agent_name,
+                    "latency_ms": event.latency_ms,
+                    "token_input": event.token_input,
+                    "token_output": event.token_output,
+                    "error": redact_secrets(event.error),
+                    **redact_secrets(event.metadata),
+                },
+                thread_id=event.conversation_id,
+            )
+        except Exception:
+            pass
+
+
+_LIVE_PROGRESS_EVENTS = {
+    "memory_retrieved",
+    "agent_started",
+    "runtime_stage_completed",
+    "workflow_route_decided",
+    "workflow_step_started",
+    "workflow_step_finished",
+    "workflow_step_failed",
+    "workflow_finished",
+    "workflow_failed",
+    "llm_call_started",
+    "llm_call_finished",
+    "llm_call_failed",
+    "critic_policy_evaluated",
+    "critic_started",
+    "critic_finished",
+    "critic_failed",
+    "memory_written",
+    "agent_finished",
+}
+
+
+def _live_progress_message(event: TraceEvent) -> str:
+    metadata = event.metadata or {}
+    event_type = event.event_type
+    if event_type == "memory_retrieved":
+        return f"长期记忆召回完成：{metadata.get('count', 0)} 条"
+    if event_type == "agent_started":
+        task_type = (metadata.get("task_classification") or {}).get("task_type", "unknown")
+        return f"Agent 已启动，任务类型：{task_type}"
+    if event_type == "runtime_stage_completed":
+        return f"运行阶段完成：{metadata.get('stage', 'unknown')}"
+    if event_type == "workflow_route_decided":
+        if metadata.get("selected"):
+            return f"已选择 workflow：{metadata.get('workflow_name')}"
+        return "未命中固定 workflow，回落 DeepAgent"
+    if event_type == "workflow_step_started":
+        return f"开始执行节点：{metadata.get('step_name')}"
+    if event_type == "workflow_step_finished":
+        return f"节点完成：{metadata.get('step_name')}，返回 {metadata.get('row_count', 0)} 行"
+    if event_type == "workflow_step_failed":
+        return f"节点失败：{metadata.get('step_name')}"
+    if event_type == "workflow_finished":
+        return f"workflow 完成：{metadata.get('workflow_name')}"
+    if event_type == "workflow_failed":
+        return f"workflow 失败：{metadata.get('workflow_name')}，回落 DeepAgent"
+    if event_type == "llm_call_started":
+        return f"开始调用模型：{metadata.get('profile') or event.agent_name}"
+    if event_type == "llm_call_finished":
+        seconds = round((event.latency_ms or 0) / 1000, 1)
+        return f"模型调用完成：{metadata.get('profile') or event.agent_name}，耗时 {seconds}s"
+    if event_type == "llm_call_failed":
+        return f"模型调用失败：{metadata.get('profile') or event.agent_name}"
+    if event_type == "critic_policy_evaluated":
+        return "Critic 策略已评估" if metadata.get("required") else "Critic 策略已评估：本次跳过"
+    if event_type == "critic_started":
+        return "Critic 开始校验"
+    if event_type == "critic_finished":
+        return "Critic 校验完成"
+    if event_type == "critic_failed":
+        return "Critic 校验失败"
+    if event_type == "memory_written":
+        return f"长期记忆写入完成：{metadata.get('written', 0)} 条"
+    if event_type == "agent_finished":
+        return f"Agent 已结束：{metadata.get('status', 'unknown')}"
+    return event_type
 
 
 # 全局 tracer：平台层默认使用这个实例；测试中可以直接 new JsonlTracer(temp_path)。

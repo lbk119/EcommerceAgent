@@ -130,6 +130,7 @@ async def _run_agent_stream(agent, user_content: str, config: dict, task_id: str
     last_non_empty_content = ""
     loop_guard = AgentLoopGuard()
     recursion_limit = config.get("recursion_limit")
+    monitor._emit("agent_stream_started", "DeepAgent 流式执行已开始，正在等待模型首个响应", {"task_id": task_id})
 
     async for chunk in agent.astream({"messages": [{"role": "user", "content": user_content}]}, config=config):
         for node_name, state in chunk.items():

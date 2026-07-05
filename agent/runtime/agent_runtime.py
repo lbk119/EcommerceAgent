@@ -105,6 +105,7 @@ class AgentRuntime:
         文件复制和 LangGraph config，避免一次重构同时改动工具上下文边界。
         """
         from agent.memory.evolution_memory import append_task_event
+        from api.monitor import monitor
         from agent.runtime.task_context import build_task_context
 
         guard_result = inspect_user_prompt(task_query)
@@ -117,6 +118,11 @@ class AgentRuntime:
             "tenant_id": tenant_id,
             "user_id": user_id,
             "shop_id": shop_id,
+            "task_classification": classification.to_dict(),
+        })
+        monitor._emit("task_started", "任务已进入 AgentRuntime", {
+            "task_id": task_id,
+            "conversation_id": conversation_id,
             "task_classification": classification.to_dict(),
         })
         tracer.emit(

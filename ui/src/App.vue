@@ -1,1637 +1,560 @@
-<script setup lang="ts">
-import { ref, onMounted, nextTick, computed } from 'vue'
-import axios from 'axios'
-import { marked } from 'marked'
+﻿<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+import { agentDefinitions, platformOptions } from './data/mockData'
+import { analyzeProducts, completeOnboarding, confirmImportJob, createOrUpdateShop, generateReplenishmentPlan, generateReport, getReport, importSampleData, JobTimeoutError, loadSession, login, logout as clearSession, previewImportJob, refreshWorkspace, register, removeShop, reviewCampaign, saveSession, sendAiMessage, setIntegration, setStrategyStatus, startAgentJob, uploadImportFile, waitForJobAndRefresh } from './services/platformApi'
+import type { AgentJob, ImportPreview } from './services/platformApi'
+import type { AuthMode, AuthSession, DigitalAgent, Integration, IntegrationStatus, OnboardingPayload, Product, ReportDetail, Shop, StrategyStatus } from './types'
 
-// Types
-interface Message {
-  role: 'user' | 'ai' | 'system'
+type ChatMessage = {
+  role: 'user' | 'assistant'
   content: string
-  logs?: LogItem[]
-  files?: FileItem[]
-  interrupt?: InterruptState
-  timestamp?: number
 }
 
-interface InterruptState {
-  summary: string
-  suggestedDecision?: string
-}
+const session = ref<AuthSession | null>(loadSession())
+const currentPath = ref(window.location.pathname)
+const authMode = ref<AuthMode>('login')
+const authError = ref('')
+const selectedAgentId = ref('')
+const shopDraft = reactive({ name: '', category: '', platform: '淘宝 / 天猫', type: '品牌自营', businessStage: '成长期' })
+const editingShopId = ref<string | null>(null)
+const selectedImportMode = ref<'sample' | 'upload' | 'paste'>('sample')
+const importNotice = ref('')
+const selectedImportFile = ref<File | null>(null)
+const importPreview = ref<ImportPreview | null>(null)
+const pendingImportJobId = ref('')
+const isImporting = ref(false)
+const activeJobNotice = ref('')
+const activeJobError = ref('')
+const isRunningJob = ref(false)
+const selectedReportId = ref('')
+const selectedReport = ref<ReportDetail | null>(null)
+const chatDraft = ref('')
+const chatMessages = ref<ChatMessage[]>([
+  { role: 'assistant', content: '我是 EcomPilot 辅助 AI 助手。你可以直接问经营数据、商品优化、库存风险、活动复盘或报告写作问题。' }
+])
 
-interface LogItem {
-  type: string
-  title: string
-  details: any
-  timestamp: string
-}
+const loginForm = reactive({ account: 'operator@example.com', password: 'admin123' })
+const registerForm = reactive({ companyName: '', name: '', email: '', password: '', confirmPassword: '' })
+const onboarding = reactive<OnboardingPayload>({
+  shopName: '',
+  category: '服饰鞋包',
+  shopType: '品牌自营',
+  businessStage: '成长期',
+  selectedPlatforms: ['淘宝 / 天猫', '抖音电商'],
+  dataMode: 'upload',
+  enabledAgentIds: agentDefinitions.map((agent) => agent.id)
+})
+const onboardingStep = ref(1)
 
-interface FileItem {
-  name: string
-  path: string
-  url: string
-}
+const workspace = computed(() => session.value?.workspace)
+const user = computed(() => session.value?.user)
+const currentShop = computed(() => workspace.value?.shops.find((shop) => shop.id === workspace.value?.currentShopId) || workspace.value?.shops[0])
+const selectedAgent = computed(() => workspace.value?.agents.find((agent) => agent.id === selectedAgentId.value) || workspace.value?.agents[0])
+const highRiskProducts = computed(() => workspace.value?.products.filter((product) => product.riskLevel === 'high') || [])
+const pendingStrategies = computed(() => workspace.value?.strategies.filter((strategy) => strategy.status === 'pending') || [])
+const authorizedIntegrations = computed(() => workspace.value?.integrations.filter((item) => item.status === 'authorized' || item.status === 'syncing') || [])
+const taskCount = computed(() => workspace.value?.agents.reduce((sum, agent) => sum + agent.tasks.filter((task) => task.status !== '已完成').length, 0) || 0)
+const hasBusinessData = computed(() => {
+  const metrics = workspace.value?.metrics
+  return Boolean(metrics && (metrics.gmv > 0 || metrics.orders > 0 || metrics.visitors > 0 || metrics.activeCampaignProducts > 0 || metrics.inventoryRiskSkuCount > 0))
+})
+const selectedReportContent = computed(() => selectedReport.value?.contentMarkdown?.trim() || selectedReport.value?.summary || '报告内容生成中，请稍后刷新。')
 
-interface QuickTask {
-  title: string
-  desc: string
-  prompt: string
-}
+const navItems = [
+  { path: '/dashboard', label: '工作台', hint: 'Dashboard' },
+  { path: '/agents', label: '数字员工', hint: 'Agents' },
+  { path: '/reports', label: '经营报告', hint: 'Reports' },
+  { path: '/products', label: '商品分析', hint: 'Products' },
+  { path: '/inventory', label: '库存风险', hint: 'Inventory' },
+  { path: '/campaigns', label: '活动复盘', hint: 'Campaigns' },
+  { path: '/ai-chat', label: 'AI 对话', hint: 'Assistant' },
+  { path: '/shops', label: '店铺管理', hint: 'Shops' },
+  { path: '/integrations', label: '平台授权', hint: 'Integrations' },
+  { path: '/data-import', label: '数据导入', hint: 'Data Import' },
+  { path: '/account', label: '个人中心', hint: 'Account' }
+]
 
-interface WorkCard {
-  title: string
-  metric: string
-  desc: string
-  tasks: QuickTask[]
-}
-
-// State
-const inputQuery = ref('')
-const messages = ref<Message[]>([])
-const status = ref<'idle' | 'running'>('idle')
-const socket = ref<WebSocket | null>(null)
-const hasSessionFiles = ref(false)
-const messagesEndRef = ref<HTMLElement | null>(null)
-const isWelcomeScreen = computed(() => messages.value.length === 0)
-const isSidebarOpen = ref(false)
-const fileList = ref<any[]>([])
-const resumeInstruction = ref('')
-// 生成一个持久的会话ID，如果页面不刷新，ID不变
-const currentThreadId = ref(crypto.randomUUID())
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
-const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
-const authToken = ref(localStorage.getItem('gateway_access_token') ?? '')
-const tenantId = ref(localStorage.getItem('gateway_tenant_id') ?? 'tenant_demo')
-const shopId = ref(localStorage.getItem('gateway_shop_id') ?? 'default_shop')
-const loginUsername = ref(localStorage.getItem('gateway_username') ?? 'local_user')
-const loginPassword = ref('admin123')
-const loginError = ref('')
-const isAuthenticated = computed(() => authToken.value.length > 0)
-
-const authHeaders = () => ({
-  Authorization: `Bearer ${authToken.value}`,
-  'X-Tenant-ID': tenantId.value,
-  'X-Shop-ID': shopId.value
+const metricCards = computed(() => {
+  const metrics = workspace.value?.metrics
+  if (!metrics) return []
+  const emptyTrend = hasBusinessData.value ? '等待对比数据' : '待导入数据'
+  return [
+    { label: '昨日 GMV', value: money(metrics.gmv), trend: emptyTrend },
+    { label: '订单数', value: metrics.orders.toLocaleString(), trend: emptyTrend },
+    { label: '转化率', value: `${metrics.conversionRate}%`, trend: emptyTrend },
+    { label: '客单价', value: money(metrics.averageOrderValue), trend: emptyTrend },
+    { label: '退款率', value: `${metrics.refundRate}%`, trend: emptyTrend },
+    { label: '库存风险 SKU', value: String(metrics.inventoryRiskSkuCount), trend: metrics.inventoryRiskSkuCount > 0 ? `${metrics.inventoryRiskSkuCount} 个风险` : '暂无风险' },
+    { label: '活动中商品', value: String(metrics.activeCampaignProducts), trend: metrics.activeCampaignProducts > 0 ? '活动进行中' : '暂无活动' },
+    { label: 'AI 已完成巡检', value: String(metrics.aiCompletedTasks), trend: metrics.aiCompletedTasks > 0 ? '今日任务' : '待启动' }
+  ]
 })
 
-const authorizedUrl = (path: string, params: Record<string, string>) => {
-  const query = new URLSearchParams({
-    ...params,
-    token: authToken.value,
-    tenant_id: tenantId.value,
-    shop_id: shopId.value
-  })
-  return `${API_BASE_URL}${path}?${query.toString()}`
+const statusText: Record<IntegrationStatus, string> = {
+  unauthorized: '未授权',
+  authorized: '已授权',
+  expired: '授权过期',
+  syncing: '同步中',
+  failed: '同步失败'
 }
 
-const persistTenantContext = () => {
-  localStorage.setItem('gateway_tenant_id', tenantId.value)
-  localStorage.setItem('gateway_shop_id', shopId.value)
+const agentStatusText: Record<DigitalAgent['status'], string> = {
+  idle: '空闲',
+  working: '工作中',
+  review: '等待审核',
+  error: '异常'
 }
 
-const login = async () => {
-  loginError.value = ''
-  try {
-    const res = await axios.post(`${API_BASE_URL}/api/v1/auth/login`, {
-      username: loginUsername.value,
-      password: loginPassword.value
-    })
-    authToken.value = res.data.access_token
-    tenantId.value = res.data.user?.default_tenant_id || tenantId.value
-    shopId.value = res.data.user?.default_shop_id || shopId.value
-    localStorage.setItem('gateway_access_token', authToken.value)
-    localStorage.setItem('gateway_tenant_id', tenantId.value)
-    localStorage.setItem('gateway_shop_id', shopId.value)
-    localStorage.setItem('gateway_username', loginUsername.value)
-    connectWebSocket()
-  } catch (error: any) {
-    loginError.value = error.response?.data?.error?.message || error.message || '登录失败'
-  }
+const reportTypeText: Record<string, string> = {
+  daily: '经营日报',
+  weekly: '经营周报',
+  monthly: '经营月报',
+  inventory: '库存风险',
+  campaign: '活动复盘',
+  product: '商品分析'
 }
 
-const logout = () => {
-  socket.value?.close()
-  socket.value = null
-  authToken.value = ''
-  localStorage.removeItem('gateway_access_token')
+function money(value: number) {
+  return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 0 }).format(value)
 }
 
-const todayBriefs = [
-  { label: '昨日经营日报', value: '待生成' },
-  { label: '库存风险巡检', value: '待执行' },
-  { label: '活动复盘建议', value: '待分析' },
-  { label: '策略进化审核', value: '待处理' }
-]
-
-const workCards: WorkCard[] = [
-  {
-    title: '店铺经营分析员',
-    metric: 'GMV / 订单 / 转化',
-    desc: '巡检销售额、订单量、客单价、转化率和退款率，生成经营诊断。',
-    tasks: [
-      {
-        title: '生成昨日经营日报',
-        desc: '销售、订单、商品、库存汇总',
-        prompt: '请作为电商运营数字员工，查询昨日店铺经营数据，分析销售额、订单量、客单价、转化率、退款率、爆品、滞销品和库存风险，并生成一份结构完整的昨日经营日报。'
-      },
-      {
-        title: '分析销量异常商品',
-        desc: '找出上涨和下滑原因',
-        prompt: '请分析最近销量异常波动的商品，分别找出销量上涨最快和下滑最明显的商品，结合订单、库存、流量和活动信息推断原因，并给出运营动作建议。'
-      }
-    ]
-  },
-  {
-    title: '商品运营助理',
-    metric: '爆品 / 滞销 / 库存',
-    desc: '识别高潜商品、库存不足、滞销积压和价格异常，输出补货和促销建议。',
-    tasks: [
-      {
-        title: '检查库存风险',
-        desc: '低库存和积压商品预警',
-        prompt: '请检查当前商品库存风险，识别低于安全库存、库存周转慢、销量下滑但库存较高的商品，并按风险等级给出补货、清仓或活动建议。'
-      },
-      {
-        title: '分析今日爆品',
-        desc: '提炼爆品增长因素',
-        prompt: '请分析今日或最近表现最好的爆品，说明其销售增长、流量、转化、价格、库存和活动因素，并给出下一步放量建议。'
-      }
-    ]
-  },
-  {
-    title: '活动复盘专员',
-    metric: '投放 / ROI / 复盘',
-    desc: '复盘大促、直播、优惠券和广告投放效果，沉淀可复用活动策略。',
-    tasks: [
-      {
-        title: '生成活动复盘报告',
-        desc: '评估投入产出和商品表现',
-        prompt: '请复盘最近一次电商活动，分析活动期间销售额、订单量、投放成本、ROI、参与商品表现、库存消耗和退款情况，并生成活动复盘报告。'
-      },
-      {
-        title: '分析退款率异常',
-        desc: '定位商品和服务问题',
-        prompt: '请分析近期退款率异常的商品或订单，定位可能的质量、物流、描述、客服或价格问题，并给出降低退款率的运营建议。'
-      }
-    ]
-  },
-  {
-    title: '知识与报告专员',
-    metric: 'SOP / FAQ / 报告',
-    desc: '检索运营 SOP、商品资料和客服知识库，生成报告并发现知识缺口。',
-    tasks: [
-      {
-        title: '发现知识库缺口',
-        desc: '沉淀客服和运营 FAQ',
-        prompt: '请检查近期电商运营和客服相关问题，结合知识库检索结果，识别知识库缺口、过期规则或冲突口径，并生成一份待补充 FAQ 清单。'
-      },
-      {
-        title: '生成老板汇报材料',
-        desc: '面向管理层的简洁结论',
-        prompt: '请基于近期店铺经营、商品、库存、活动和客服数据，生成一份面向管理层的电商运营汇报材料，突出关键结论、风险、机会和下一步动作。'
-      }
-    ]
-  }
-]
-
-const setQuickTask = (prompt: string) => {
-  inputQuery.value = prompt
+function reportTypeLabel(type: string) {
+  return reportTypeText[type] || type
 }
 
-const runQuickTask = async (prompt: string) => {
-  inputQuery.value = prompt
-  await sendMessage()
+function navigate(path: string) {
+  window.history.pushState({}, '', path)
+  currentPath.value = path
+  if (path.startsWith('/agents/')) selectedAgentId.value = path.split('/').pop() || ''
+  enforceRouteGuard()
 }
 
-// Helper: Scroll to bottom
-const scrollToBottom = async () => {
-  await nextTick()
-  if (messagesEndRef.value) {
-    messagesEndRef.value.scrollIntoView({ behavior: 'smooth' })
-  }
-}
-
-// Fetch Files
-const fetchFiles = async () => {
-  if (!hasSessionFiles.value || !isAuthenticated.value) return
-  try {
-    const res = await axios.get(`${API_BASE_URL}/api/v1/files`, {
-      params: { conversation_id: currentThreadId.value },
-      headers: authHeaders()
-    })
-    if (res.data.files) {
-      fileList.value = res.data.files.map((f: any) => ({
-        ...f,
-        // 下载只传 conversation_id + filename，后端会按当前网关身份校验文件归属。
-        url: authorizedUrl('/api/v1/download', { conversation_id: currentThreadId.value, filename: f.filename })
-      }))
-    }
-  } catch (e) {
-    console.error('Failed to fetch files', e)
-  }
-}
-
-// WebSocket Connection
-const connectWebSocket = () => {
-  if (!isAuthenticated.value) return
-  persistTenantContext()
-  socket.value?.close()
-  const query = new URLSearchParams({
-    token: authToken.value,
-    tenant_id: tenantId.value,
-    shop_id: shopId.value
-  })
-  const ws = new WebSocket(`${WS_BASE_URL}/api/v1/ws/${currentThreadId.value}?${query.toString()}`)
-
-  ws.onopen = () => {
-    console.log('WebSocket Connected')
-  }
-
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data)
-      handleSocketMessage(data)
-    } catch (e) {
-      console.error('Error parsing WS message:', e)
-    }
-  }
-
-  ws.onclose = () => {
-    console.log('WebSocket Disconnected, retrying in 3s...')
-    if (isAuthenticated.value) {
-      setTimeout(connectWebSocket, 3000)
-    }
-  }
-
-  socket.value = ws
-}
-
-// Handle Incoming Messages
-const handleSocketMessage = (data: any) => {
-  const { type, event, message, data: eventData } = data
-
-  if (type === 'pong') return
-
-  let lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai')
-  
-  if (event === 'session_created') {
-    hasSessionFiles.value = true
-    isSidebarOpen.value = true
-    fetchFiles()
-  } else if (event === 'tool_start') {
-    // 触发文件列表刷新，以确保用户能看到生成的文件
-    if (hasSessionFiles.value) {
-      // 延迟一点刷新，因为工具刚开始运行，文件可能还没生成
-      // 但如果是“写入文件”类工具，可能很快就有了
-      // 这里可以尝试立即刷新 + 延迟刷新
-      fetchFiles()
-      setTimeout(fetchFiles, 2000)
-    }
-
-    if (lastAiMsg) {
-      if (!lastAiMsg.logs) lastAiMsg.logs = []
-      lastAiMsg.logs.push({
-        type: 'tool',
-        title: `使用的工具： ${eventData.tool_name}...`,
-        details: eventData.args,
-        timestamp: new Date().toLocaleTimeString()
-      })
-      
-      if (eventData.args && eventData.args.filename) {
-        if (!lastAiMsg.files) lastAiMsg.files = []
-        const fileUrl = authorizedUrl('/api/v1/download', { conversation_id: currentThreadId.value, filename: eventData.args.filename })
-        // Avoid duplicates
-        if (!lastAiMsg.files.find(f => f.name === eventData.args.filename)) {
-           lastAiMsg.files.push({
-            name: eventData.args.filename,
-            path: eventData.args.filename,
-            url: fileUrl
-          })
-        }
-      }
-    }
-  } else if (event === 'assistant_call') {
-    // 同样刷新文件列表
-    if (hasSessionFiles.value) {
-        fetchFiles()
-    }
-     if (lastAiMsg) {
-      if (!lastAiMsg.logs) lastAiMsg.logs = []
-      lastAiMsg.logs.push({
-        type: 'agent',
-        title: `正在使用助手： ${eventData.assistant_name}...`,
-        details: eventData.args,
-        timestamp: new Date().toLocaleTimeString()
-      })
-    }
-  } else if (event === 'task_result') {
-    if (lastAiMsg) {
-      lastAiMsg.content = eventData.result
-    } else {
-       messages.value.push({
-        role: 'ai',
-        content: eventData.result,
-        timestamp: Date.now()
-      })
-    }
-    status.value = 'idle'
-    fetchFiles()
-  } else if (event === 'human_interrupt') {
-    if (lastAiMsg) {
-      lastAiMsg.content = '任务检测到可能的重复调用，已暂停等待你的决策。'
-      lastAiMsg.interrupt = {
-        summary: eventData.summary,
-        suggestedDecision: eventData.suggested_decision
-      }
-      if (!lastAiMsg.logs) lastAiMsg.logs = []
-      lastAiMsg.logs.push({
-        type: 'interrupt',
-        title: '已暂停，等待人工决策',
-        details: eventData.summary,
-        timestamp: new Date().toLocaleTimeString()
-      })
-    }
-    status.value = 'idle'
-  } else if (event === 'error') {
-    if (lastAiMsg && !lastAiMsg.content) {
-      lastAiMsg.content = `任务执行失败：${message}`
-      if (!lastAiMsg.logs) lastAiMsg.logs = []
-      lastAiMsg.logs.push({
-        type: 'error',
-        title: '任务执行失败',
-        details: message,
-        timestamp: new Date().toLocaleTimeString()
-      })
-    } else {
-      messages.value.push({
-        role: 'system',
-        content: `任务执行失败：${message}`,
-        timestamp: Date.now()
-      })
-    }
-    status.value = 'idle'
-  }
-  
-  scrollToBottom()
-}
-
-const resumeTask = async (decision: 'continue' | 'revise' | 'abort') => {
-  const lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai' && m.interrupt)
-  if (!lastAiMsg || status.value === 'running' || !isAuthenticated.value) return
-
-  try {
-    status.value = 'running'
-    await axios.post(`${API_BASE_URL}/api/v1/tasks/${currentThreadId.value}/resume`, {
-      decision,
-      instruction: resumeInstruction.value
-    }, {
-      headers: authHeaders()
-    })
-    if (!lastAiMsg.logs) lastAiMsg.logs = []
-    lastAiMsg.logs.push({
-      type: 'resume',
-      title: `人工决策：${decision}`,
-      details: resumeInstruction.value || null,
-      timestamp: new Date().toLocaleTimeString()
-    })
-    lastAiMsg.interrupt = undefined
-    resumeInstruction.value = ''
-  } catch (error: any) {
-    status.value = 'idle'
-    messages.value.push({
-      role: 'system',
-      content: `恢复任务失败：${error.message || error}`,
-      timestamp: Date.now()
-    })
-  }
-}
-
-// Send Message
-const sendMessage = async () => {
-  if ((!inputQuery.value.trim() && selectedFiles.value.length === 0) || status.value === 'running') return
-  if (!isAuthenticated.value) {
-    messages.value.push({
-      role: 'system',
-      content: '请先登录网关，再提交任务。',
-      timestamp: Date.now()
-    })
+function enforceRouteGuard() {
+  const isAuthenticated = Boolean(session.value)
+  const isAuthPage = currentPath.value === '/' || currentPath.value === '/login'
+  if (!isAuthenticated && !isAuthPage) {
+    window.history.replaceState({}, '', '/login')
+    currentPath.value = '/login'
     return
   }
-
-  const query = inputQuery.value
-  inputQuery.value = ''
-  status.value = 'running'
-
-  messages.value.push({
-    role: 'user',
-    content: query,
-    timestamp: Date.now()
-  })
-
-  messages.value.push({
-    role: 'ai',
-    content: '', // Start empty, show "Thinking" via logs/status if needed, or placeholder
-    logs: [],
-    files: [],
-    timestamp: Date.now()
-  })
-
-  scrollToBottom()
-
-  // Handle File Upload
-  if (selectedFiles.value.length > 0) {
-    console.log('Uploading files:', selectedFiles.value)
-    
-    // Log to UI
-    const lastAiMsg = messages.value[messages.value.length - 1]
-    if (lastAiMsg && lastAiMsg.role === 'ai') {
-        if (!lastAiMsg.logs) lastAiMsg.logs = []
-        
-        const fileDetails = selectedFiles.value.map(f => ({ name: f.name, size: f.size }))
-        
-        lastAiMsg.logs.push({
-            type: 'info',
-            title: `Uploading ${selectedFiles.value.length} file(s)...`,
-            details: fileDetails,
-            timestamp: new Date().toLocaleTimeString()
-        })
-    }
-
-    // Actual Upload
-    try {
-        const formData = new FormData()
-        // Ensure thread_id is available
-        if (typeof currentThreadId !== 'undefined' && currentThreadId.value) {
-             formData.append('thread_id', currentThreadId.value)
-        } else {
-             // Fallback if no thread ID (should ideally not happen as initialized in state)
-             console.warn('No thread ID found for upload')
-        }
-
-        selectedFiles.value.forEach(file => {
-            console.log(`Appending file to FormData: name=${file.name}, size=${file.size}, type=${file.type}`)
-            formData.append('files', file)
-        })
-
-        await axios.post(`${API_BASE_URL}/api/v1/uploads`, formData, {
-            headers: {
-            'Content-Type': 'multipart/form-data',
-            ...authHeaders()
-            }
-        })
-        
-        // Clear files after successful upload
-        selectedFiles.value = []
-        
-        if (lastAiMsg && lastAiMsg.logs) {
-            lastAiMsg.logs.push({
-                type: 'success',
-                title: 'Files uploaded successfully',
-                details: null,
-                timestamp: new Date().toLocaleTimeString()
-            })
-        }
-
-    } catch (e: any) {
-        console.error('Upload failed', e)
-        if (lastAiMsg && lastAiMsg.logs) {
-            lastAiMsg.logs.push({
-                type: 'error',
-                title: 'File upload failed',
-                details: e.message || 'Unknown error',
-                timestamp: new Date().toLocaleTimeString()
-            })
-        }
-        // Don't stop task execution, but maybe warn user?
-    }
+  if (!isAuthenticated && currentPath.value === '/') {
+    window.history.replaceState({}, '', '/login')
+    currentPath.value = '/login'
+    return
   }
+  if (isAuthenticated && !session.value?.user.onboardingCompleted && currentPath.value !== '/onboarding') {
+    window.history.replaceState({}, '', '/onboarding')
+    currentPath.value = '/onboarding'
+    return
+  }
+  if (isAuthenticated && session.value?.user.onboardingCompleted && isAuthPage) {
+    window.history.replaceState({}, '', '/dashboard')
+    currentPath.value = '/dashboard'
+  }
+}
 
+async function submitLogin() {
+  authError.value = ''
   try {
-    const payload: any = { query }
-    // Only add thread_id if it exists and is not empty
-    if (typeof currentThreadId !== 'undefined' && currentThreadId.value) {
-      payload.thread_id = currentThreadId.value
+    session.value = await login(loginForm)
+    navigate(session.value.user.onboardingCompleted ? '/dashboard' : '/onboarding')
+    if (session.value.user.onboardingCompleted) {
+      refreshWorkspace(session.value).then((nextSession) => {
+        session.value = nextSession
+      }).catch((error) => {
+        authError.value = error instanceof Error ? error.message : '工作区数据刷新失败'
+      })
     }
-    console.log('Sending request payload:', payload)
-    const res = await axios.post(`${API_BASE_URL}/api/v1/tasks`, payload, {
-      headers: authHeaders()
-    })
-    
-    if (res.data && res.data.thread_id) {
-      currentThreadId.value = res.data.thread_id
-    }
-  } catch (error: any) {
-    console.error('Request failed:', error)
-    let errorMsg = 'Failed to send request.'
-    if (error.message) errorMsg += ` (${error.message})`
-    if (error.response && error.response.data) {
-        errorMsg += ` Server says: ${JSON.stringify(error.response.data)}`
-    }
-    
-    messages.value.push({
-      role: 'system',
-      content: errorMsg,
-      timestamp: Date.now()
-    })
-    status.value = 'idle'
+  } catch (error) {
+    authError.value = error instanceof Error ? error.message : '登录失败'
   }
 }
 
-// File Upload
-const fileInputRef = ref<HTMLInputElement | null>(null)
-const selectedFiles = ref<File[]>([])
-
-const triggerFileUpload = () => {
-  fileInputRef.value?.click()
-}
-
-const handleFileChange = (event: Event) => {
-  const target = event.target as HTMLInputElement
-  if (target.files && target.files.length > 0) {
-    // Append new files to existing list
-    selectedFiles.value = [...selectedFiles.value, ...Array.from(target.files)]
-    console.log('Files selected:', selectedFiles.value)
-    // Reset input so same file can be selected again if needed
-    target.value = ''
+async function submitRegister() {
+  authError.value = ''
+  try {
+    session.value = await register(registerForm)
+    navigate('/onboarding')
+  } catch (error) {
+    authError.value = error instanceof Error ? error.message : '注册失败'
   }
 }
 
-const removeFile = (index: number) => {
-  selectedFiles.value.splice(index, 1)
+async function finishOnboarding() {
+  if (!session.value) return
+  session.value = await completeOnboarding(session.value, onboarding)
+  navigate('/dashboard')
+  refreshWorkspace(session.value).then((nextSession) => {
+    session.value = nextSession
+  }).catch(() => {
+    // 首次进入工作台不因为完整经营聚合失败而阻塞；用户仍可继续使用基础导航。
+  })
 }
 
-const renderMarkdown = (text: string) => {
-  if (!text) return '<span class="typing-indicator">Thinking...</span>'
-  return marked(text)
+function toggleOnboardingPlatform(platform: string) {
+  const index = onboarding.selectedPlatforms.indexOf(platform)
+  if (index >= 0) onboarding.selectedPlatforms.splice(index, 1)
+  else onboarding.selectedPlatforms.push(platform)
+}
+
+function toggleOnboardingAgent(agentId: string) {
+  const index = onboarding.enabledAgentIds.indexOf(agentId)
+  if (index >= 0) onboarding.enabledAgentIds.splice(index, 1)
+  else onboarding.enabledAgentIds.push(agentId)
+}
+
+async function switchShop(shopId: string) {
+  if (!workspace.value || !session.value) return
+  workspace.value.currentShopId = shopId
+  saveSession(session.value)
+  try {
+    session.value = await refreshWorkspace(session.value)
+  } catch {
+    saveSession(session.value)
+  }
+}
+
+function startEditShop(shop: Shop) {
+  editingShopId.value = shop.id
+  Object.assign(shopDraft, { name: shop.name, category: shop.category, platform: shop.platform, type: shop.type, businessStage: shop.businessStage })
+}
+
+async function saveShop() {
+  if (!workspace.value || !session.value || !shopDraft.name.trim()) return
+  session.value = await createOrUpdateShop(session.value, shopDraft, editingShopId.value || undefined)
+  editingShopId.value = null
+  Object.assign(shopDraft, { name: '', category: '', platform: '淘宝 / 天猫', type: '品牌自营', businessStage: '成长期' })
+}
+
+async function deleteShop(shopId: string) {
+  if (!workspace.value || !session.value || workspace.value.shops.length <= 1) return
+  const previousSession = session.value
+  const nextShops = previousSession.workspace.shops.filter((shop) => shop.id !== shopId)
+  const nextCurrentShopId = previousSession.workspace.currentShopId === shopId ? nextShops[0]?.id || '' : previousSession.workspace.currentShopId
+  session.value = { ...previousSession, workspace: { ...previousSession.workspace, shops: nextShops, currentShopId: nextCurrentShopId } }
+  saveSession(session.value)
+  removeShop(previousSession, shopId).catch(() => {
+    session.value = previousSession
+    saveSession(previousSession)
+  })
+}
+
+async function setIntegrationStatus(integration: Integration, nextStatus: IntegrationStatus) {
+  if (!session.value) return
+  session.value = await setIntegration(session.value, integration.platform, nextStatus)
+}
+
+async function updateStrategy(strategyId: string, status: StrategyStatus) {
+  if (!workspace.value || !session.value) return
+  session.value = await setStrategyStatus(session.value, strategyId, status)
+}
+
+async function runAgent(agent: DigitalAgent) {
+  await runTrackedJob((currentSession) => startAgentJob(currentSession, agent.id, `${agent.name}巡检`), '数字员工任务已启动')
+}
+
+async function completeAgentOutput(agent: DigitalAgent, title: string) {
+  const reportTypeByAgent: Record<string, string> = { 'store-analyst': 'daily', 'product-assistant': 'product', 'inventory-inspector': 'inventory', 'campaign-reviewer': 'campaign', 'report-specialist': 'weekly' }
+  await runTrackedJob(async (currentSession) => (await generateReport(currentSession, reportTypeByAgent[agent.id] || 'daily', title, agent.id)).job, '报告生成任务已启动')
+}
+
+async function runTrackedJob(factory: (currentSession: AuthSession) => Promise<AgentJob>, startedText: string) {
+  if (!session.value || isRunningJob.value) return
+  activeJobError.value = ''
+  activeJobNotice.value = startedText
+  isRunningJob.value = true
+  try {
+    const job = await factory(session.value)
+    activeJobNotice.value = '数字员工任务已启动，正在分析数据…'
+    session.value = await waitForJobAndRefresh(session.value, job.jobId || job.id)
+    activeJobNotice.value = '报告已生成，工作台数据已刷新。'
+  } catch (error) {
+    if (error instanceof JobTimeoutError) activeJobNotice.value = error.message
+    else activeJobError.value = `任务失败：${error instanceof Error ? error.message : '未知错误'}`
+  } finally {
+    isRunningJob.value = false
+  }
+}
+
+async function runWeeklyReport() {
+  await runTrackedJob(async (currentSession) => (await generateReport(currentSession, 'weekly', '管理层经营周报', 'report-specialist')).job, '管理层周报任务已启动')
+}
+
+async function runProductAnalysis() {
+  await runTrackedJob(analyzeProducts, '商品优化任务已启动')
+}
+
+async function runReplenishmentPlan() {
+  await runTrackedJob(generateReplenishmentPlan, '补货建议任务已启动')
+}
+
+async function runCampaignReview() {
+  const campaign = workspace.value?.campaigns[0]
+  if (!campaign) {
+    activeJobNotice.value = ''
+    activeJobError.value = '任务失败：当前没有可复盘的活动数据'
+    return
+  }
+  await runTrackedJob((currentSession) => reviewCampaign(currentSession, campaign.id), '活动复盘任务已启动')
+}
+
+async function openReportDetail(reportId: string) {
+  if (!session.value) return
+  selectedReportId.value = reportId
+  selectedReport.value = await getReport(session.value, reportId)
+}
+
+async function useSampleData() {
+  if (!workspace.value || !session.value) return
+  const result = await importSampleData(session.value)
+  session.value = result.session
+  importNotice.value = `示例经营数据已导入，已生成经营概览报告${result.job.generatedReportId ? ' 1 条' : ' 0 条'}、待审核策略 ${result.job.generatedStrategiesCount || 0} 条，可以去工作台查看。`
+}
+
+function handleImportFileChange(event: Event) {
+  const files = (event.target as HTMLInputElement).files
+  selectedImportFile.value = files?.[0] || null
+  importPreview.value = null
+  pendingImportJobId.value = ''
+  importNotice.value = selectedImportFile.value ? `已选择文件：${selectedImportFile.value.name}` : ''
+}
+
+async function executeImport() {
+  if (!session.value) return
+  importNotice.value = ''
+  if (selectedImportMode.value === 'sample') {
+    await useSampleData()
+    return
+  }
+  if (selectedImportMode.value === 'paste') {
+    importNotice.value = '粘贴导入还未开放，请先使用 CSV 上传或示例数据。'
+    return
+  }
+  if (!selectedImportFile.value) {
+    importNotice.value = '请先选择一个 CSV 文件，再执行导入。'
+    return
+  }
+  isImporting.value = true
+  try {
+    const job = await uploadImportFile(session.value, selectedImportFile.value)
+    pendingImportJobId.value = job.id
+    importPreview.value = await previewImportJob(session.value, job.id)
+    importNotice.value = `文件 ${job.fileName} 已上传，识别到 ${importPreview.value.rows.length} 行预览数据。确认无误后点击“确认入库”。`
+  } catch (error) {
+    importNotice.value = error instanceof Error ? error.message : '文件上传失败'
+  } finally {
+    isImporting.value = false
+  }
+}
+
+async function confirmUploadedImport() {
+  if (!session.value || !pendingImportJobId.value) return
+  isImporting.value = true
+  try {
+    const result = await confirmImportJob(session.value, pendingImportJobId.value)
+    session.value = result.session
+    importNotice.value = `数据已确认入库，已生成经营概览报告${result.job.generatedReportId ? ' 1 条' : ' 0 条'}、待审核策略 ${result.job.generatedStrategiesCount || 0} 条，工作台指标已刷新。`
+    pendingImportJobId.value = ''
+  } catch (error) {
+    importNotice.value = error instanceof Error ? error.message : '确认入库失败'
+  } finally {
+    isImporting.value = false
+  }
+}
+
+async function sendChatMessage() {
+  const content = chatDraft.value.trim()
+  if (!content || !session.value) return
+  chatMessages.value.push({ role: 'user', content })
+  chatDraft.value = ''
+  try {
+    chatMessages.value.push({ role: 'assistant', content: await sendAiMessage(session.value, content) })
+  } catch {
+    chatMessages.value.push({ role: 'assistant', content: buildAssistantReply(content) })
+  }
+}
+
+function clearChat() {
+  chatMessages.value = [{ role: 'assistant', content: '对话已清空。你可以继续问我经营分析、商品、库存、活动或报告相关问题。' }]
+}
+
+function buildAssistantReply(content: string) {
+  const metrics = workspace.value?.metrics
+  const highRisk = highRiskProducts.value.map((product) => `${product.name}（${product.riskReason}）`).join('、')
+  if (/库存|补货|缺货|滞销/.test(content)) {
+    return `当前有 ${metrics?.inventoryRiskSkuCount ?? 0} 个库存风险 SKU，高风险集中在 ${highRisk || '暂无高风险商品'}。建议先处理活动备货不足和低库存商品，再评估滞销清仓策略。`
+  }
+  if (/日报|经营|GMV|订单|转化/.test(content)) {
+    return `昨日 GMV 为 ${money(metrics?.gmv ?? 0)}，订单 ${metrics?.orders ?? 0} 单，转化率 ${metrics?.conversionRate ?? 0}%。主要关注点是增长商品的库存承接，以及退款率 ${metrics?.refundRate ?? 0}% 的异常来源。`
+  }
+  if (/活动|复盘|ROI|投放/.test(content)) {
+    const campaign = workspace.value?.campaigns[0]
+    return campaign ? `${campaign.name} 的效果评分为 ${campaign.score}，ROI ${campaign.roi}，GMV ${money(campaign.gmv)}。AI 复盘结论：${campaign.conclusion}` : '当前没有可复盘的活动数据。'
+  }
+  if (/商品|爆品|优化|价格/.test(content)) {
+    const product = workspace.value?.products[0]
+    return product ? `${product.name} 当前属于${product.layer}，销量 ${product.sales}，转化率 ${product.conversionRate}%。建议：${product.aiSuggestion}` : '当前没有商品数据。'
+  }
+  return '我可以基于当前经营数据给出辅助判断。你可以继续追问：库存怎么补、昨日经营异常在哪里、哪个商品应该优化、最近活动复盘结论是什么。'
+}
+
+function logout() {
+  clearSession()
+  session.value = null
+  navigate('/login')
+}
+
+function openAgent(agentId: string) {
+  selectedAgentId.value = agentId
+  navigate(`/agents/${agentId}`)
+}
+
+function pageTitle() {
+  if (currentPath.value.startsWith('/agents/')) return selectedAgent.value?.name || '数字员工工作台'
+  return navItems.find((item) => item.path === currentPath.value)?.label || '工作台'
+}
+
+function riskLabel(product: Product) {
+  return product.riskLevel === 'high' ? '高风险' : product.riskLevel === 'medium' ? '中风险' : '低风险'
 }
 
 onMounted(() => {
-  if (isAuthenticated.value) {
-    connectWebSocket()
+  window.addEventListener('ecompilot:auth-expired', () => {
+    session.value = null
+    navigate('/login')
+  })
+  window.addEventListener('popstate', () => {
+    currentPath.value = window.location.pathname
+    if (currentPath.value.startsWith('/agents/')) selectedAgentId.value = currentPath.value.split('/').pop() || ''
+    enforceRouteGuard()
+  })
+  if (currentPath.value.startsWith('/agents/')) selectedAgentId.value = currentPath.value.split('/').pop() || ''
+  enforceRouteGuard()
+  if (session.value?.user.onboardingCompleted) {
+    refreshWorkspace(session.value).then((nextSession) => {
+      session.value = nextSession
+    }).catch(() => {
+      // 保留本地会话，避免后端临时不可用时把用户踢回登录页。
+    })
   }
 })
 </script>
 
 <template>
-  <div class="app-container">
-    <!-- Main Content -->
-    <main class="main-content" :class="{ 'centered-layout': isWelcomeScreen }">
-      <section class="auth-strip">
-        <div class="auth-fields" v-if="!isAuthenticated">
-          <input v-model="loginUsername" placeholder="用户 ID" />
-          <input v-model="loginPassword" type="password" placeholder="密码" @keydown.enter="login" />
-          <button @click="login">登录网关</button>
-          <span v-if="loginError" class="auth-error">{{ loginError }}</span>
-        </div>
-        <div class="auth-fields" v-else>
-          <span class="auth-badge">{{ loginUsername }} / {{ tenantId }} / {{ shopId }}</span>
-          <input v-model="tenantId" placeholder="tenant_id" @change="connectWebSocket" />
-          <input v-model="shopId" placeholder="shop_id" @change="connectWebSocket" />
-          <button @click="logout">退出</button>
-        </div>
+  <main v-if="!session" class="auth-page">
+    <section class="auth-panel">
+      <div class="brand-block">
+        <div class="brand-mark">EP</div>
+        <p class="eyebrow">EcomPilot</p>
+        <h1>电商运营数字员工平台</h1>
+        <p>连接多平台店铺数据，让 AI 数字员工自动巡检、发现问题、生成建议和报告。</p>
+        <div class="auth-proof"><span>多店铺接入</span><span>工作流式 AI 员工</span><span>报告与策略沉淀</span></div>
+      </div>
+      <div class="auth-card">
+        <div class="segmented"><button :class="{ active: authMode === 'login' }" @click="authMode = 'login'">登录</button><button :class="{ active: authMode === 'register' }" @click="authMode = 'register'">注册</button></div>
+        <form v-if="authMode === 'login'" @submit.prevent="submitLogin" class="form-stack">
+          <label>手机号或邮箱<input v-model="loginForm.account" autocomplete="username" /></label>
+          <label>密码<input v-model="loginForm.password" type="password" autocomplete="current-password" /></label>
+          <button class="primary-btn" type="submit">登录工作台</button>
+          <button class="link-btn" type="button">忘记密码</button>
+        </form>
+        <form v-else @submit.prevent="submitRegister" class="form-stack">
+          <label>企业/团队名称<input v-model="registerForm.companyName" required /></label>
+          <label>用户姓名<input v-model="registerForm.name" required /></label>
+          <label>手机号或邮箱<input v-model="registerForm.email" required autocomplete="username" /></label>
+          <label>密码<input v-model="registerForm.password" type="password" required autocomplete="new-password" /></label>
+          <label>确认密码<input v-model="registerForm.confirmPassword" type="password" required autocomplete="new-password" /></label>
+          <button class="primary-btn" type="submit">创建团队并初始化</button>
+        </form>
+        <p v-if="authError" class="error-text">{{ authError }}</p>
+      </div>
+    </section>
+  </main>
+
+  <main v-else-if="!user?.onboardingCompleted" class="onboarding-page">
+    <section class="onboarding-shell">
+      <aside class="onboarding-rail">
+        <div class="brand-mark">EP</div><h1>初始化你的运营工作台</h1><p>先接入店铺、平台和样例数据，再启用数字员工。</p>
+        <ol><li :class="{ active: onboardingStep === 1 }">创建店铺</li><li :class="{ active: onboardingStep === 2 }">关联平台</li><li :class="{ active: onboardingStep === 3 }">导入数据</li><li :class="{ active: onboardingStep === 4 }">选择员工</li></ol>
+      </aside>
+      <section class="onboarding-card">
+        <template v-if="onboardingStep === 1">
+          <h2>创建店铺</h2>
+          <div class="form-grid"><label>店铺名称<input v-model="onboarding.shopName" placeholder="例如：夏日服饰旗舰店" /></label><label>主营类目<input v-model="onboarding.category" /></label><label>店铺类型<select v-model="onboarding.shopType"><option>品牌自营</option><option>代运营</option><option>分销</option><option>其他</option></select></label><label>经营阶段<select v-model="onboarding.businessStage"><option>冷启动</option><option>成长期</option><option>稳定期</option><option>下滑期</option></select></label></div>
+        </template>
+        <template v-else-if="onboardingStep === 2">
+          <h2>关联电商平台</h2>
+          <div class="platform-grid"><button v-for="platform in platformOptions" :key="platform" :class="['platform-card', { active: onboarding.selectedPlatforms.includes(platform) }]" @click="toggleOnboardingPlatform(platform)"><strong>{{ platform }}</strong><span>{{ onboarding.selectedPlatforms.includes(platform) ? '已选择' : '待接入' }}</span></button></div>
+        </template>
+        <template v-else-if="onboardingStep === 3">
+          <h2>导入经营数据</h2>
+          <div class="choice-grid"><button :class="{ active: onboarding.dataMode === 'sample' }" @click="onboarding.dataMode = 'sample'">使用示例数据体验<span>自动生成订单、商品、活动与库存样例</span></button><button :class="{ active: onboarding.dataMode === 'upload' }" @click="onboarding.dataMode = 'upload'">上传 Excel / CSV<span>解析流程暂以 mock 展示</span></button><button :class="{ active: onboarding.dataMode === 'paste' }" @click="onboarding.dataMode = 'paste'">粘贴数据<span>支持复制表格数据后映射字段</span></button></div>
+          <div class="mapping-preview"><span>订单号</span><span>商品 SKU</span><span>成交金额</span><span>库存</span><span>退款状态</span></div>
+        </template>
+        <template v-else>
+          <h2>选择数字员工</h2>
+          <div class="agent-select-grid"><button v-for="agent in agentDefinitions" :key="agent.id" :class="{ active: onboarding.enabledAgentIds.includes(agent.id) }" @click="toggleOnboardingAgent(agent.id)"><strong>{{ agent.name }}</strong><span>{{ agent.role }}</span></button></div>
+        </template>
+        <div class="onboarding-actions"><button class="secondary-btn" :disabled="onboardingStep === 1" @click="onboardingStep -= 1">上一步</button><button v-if="onboardingStep < 4" class="primary-btn" @click="onboardingStep += 1">下一步</button><button v-else class="primary-btn" @click="finishOnboarding">完成并进入工作台</button></div>
       </section>
-      
-      <!-- Sidebar Toggle Button -->
-      <button 
-        v-if="hasSessionFiles && !isSidebarOpen"
-        class="sidebar-toggle-btn" 
-        @click="isSidebarOpen = true"
-        title="Open File Sidebar"
-      >
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M4 6H20M4 12H20M4 18H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-      </button>
+    </section>
+  </main>
 
-      <!-- Welcome Screen -->
-      <div v-if="isWelcomeScreen" class="welcome-screen">
-        <div class="commerce-hero">
-          <div class="hero-copy">
-            <span class="eyebrow">E-commerce Digital Worker</span>
-            <h1>电商运营数字员工</h1>
-            <p>自动巡检店铺数据，分析商品表现，生成经营报告，并把每次运营经验沉淀为可审核的进化策略。</p>
-          </div>
-          <div class="hero-status">
-            <div v-for="item in todayBriefs" :key="item.label" class="status-tile">
-              <span>{{ item.label }}</span>
-              <strong>{{ item.value }}</strong>
-            </div>
-          </div>
+  <main v-else class="app-shell">
+    <aside class="sidebar"><div class="sidebar-brand"><div class="brand-mark">EP</div><div><strong>EcomPilot</strong><span>电商运营数字员工</span></div></div><nav><button v-for="item in navItems" :key="item.path" :class="{ active: currentPath === item.path || (item.path === '/agents' && currentPath.startsWith('/agents/')) }" @click="navigate(item.path)"><span>{{ item.label }}</span><small>{{ item.hint }}</small></button></nav></aside>
+    <section class="workspace">
+      <header class="topbar"><div><p class="eyebrow">{{ currentShop?.name }}</p><h1>{{ pageTitle() }}</h1></div><div class="topbar-tools"><label class="shop-picker">当前店铺<select :value="workspace?.currentShopId" @change="switchShop(($event.target as HTMLSelectElement).value)"><option v-for="shop in workspace?.shops" :key="shop.id" :value="shop.id">{{ shop.name }}</option></select></label><span class="status-pill good">{{ authorizedIntegrations.length }} 个平台已接入</span><span class="status-pill">数据更新 {{ currentShop?.lastSyncAt }}</span><span class="status-pill warning">今日待处理 {{ taskCount }}</span><button class="avatar-btn" @click="navigate('/account')">{{ user?.name.slice(0, 1) }}</button></div></header>
+      <section class="content-scroll">
+        <div v-if="activeJobNotice || activeJobError" class="job-status-bar">
+          <span v-if="activeJobNotice" class="success-text">{{ activeJobNotice }}</span>
+          <span v-if="activeJobError" class="error-text">{{ activeJobError }}</span>
         </div>
-
-        <div class="workbench-grid">
-          <section v-for="card in workCards" :key="card.title" class="work-card">
-            <div class="work-card-header">
-              <div>
-                <h2>{{ card.title }}</h2>
-                <span>{{ card.metric }}</span>
+        <template v-if="currentPath === '/dashboard'">
+          <div class="metric-grid"><article v-for="card in metricCards" :key="card.label" class="metric-card"><span>{{ card.label }}</span><strong>{{ card.value }}</strong><em>{{ card.trend }}</em></article></div>
+          <div class="dashboard-grid">
+            <section class="panel wide"><div class="panel-header"><div><p class="eyebrow">Daily Brief</p><h2>昨日经营日报</h2></div><button class="secondary-btn" @click="navigate('/reports')">查看完整报告</button></div><template v-if="hasBusinessData"><p class="summary-text">昨日 GMV {{ money(workspace!.metrics.gmv) }}，订单 {{ workspace!.metrics.orders }} 单，转化率 {{ workspace!.metrics.conversionRate }}%，退款率 {{ workspace!.metrics.refundRate }}%。</p><div class="insight-row"><span>客单价 {{ money(workspace!.metrics.averageOrderValue) }}</span><span>访客 {{ workspace!.metrics.visitors }}</span><span>库存风险 {{ workspace!.metrics.inventoryRiskSkuCount }} 个</span></div><div class="ai-conclusion">AI 结论：已基于当前导入数据生成经营概览，建议继续查看商品、库存和活动详情。</div></template><template v-else><p class="summary-text">当前店铺还没有导入订单、商品、库存或活动数据，经营日报将在数据接入后生成。</p><div class="insight-row"><span>GMV 0</span><span>订单 0</span><span>转化率 0%</span></div><div class="ai-conclusion">AI 结论：请先在“数据导入”中上传经营数据，或在“平台授权”中完成真实平台授权。</div></template></section>
+            <section class="panel"><div class="panel-header"><h2>库存风险巡检</h2><button class="secondary-btn" :disabled="isRunningJob" @click="runReplenishmentPlan">{{ isRunningJob ? '正在分析数据...' : '一键生成补货建议' }}</button></div><table><thead><tr><th>SKU</th><th>风险</th><th>原因</th><th>建议动作</th></tr></thead><tbody><tr v-for="product in highRiskProducts" :key="product.id"><td>{{ product.sku }}</td><td><span class="risk high">{{ riskLabel(product) }}</span></td><td>{{ product.riskReason }}</td><td>{{ product.aiSuggestion }}</td></tr></tbody></table></section>
+            <section class="panel"><div class="panel-header"><h2>活动复盘建议</h2><button class="secondary-btn" @click="navigate('/campaigns')">查看复盘报告</button></div><p v-if="!workspace?.campaigns.length" class="summary-text">当前没有可复盘的活动数据。</p><div v-for="campaign in workspace?.campaigns.slice(0, 3)" :key="campaign.id" class="list-item"><strong>{{ campaign.name }}</strong><span>评分 {{ campaign.score }} · ROI {{ campaign.roi }} · GMV {{ money(campaign.gmv) }}</span><p>{{ campaign.conclusion }}</p></div></section>
+            <section class="panel wide"><div class="panel-header"><div><p class="eyebrow">Human Review</p><h2>策略进化审核</h2></div></div><table><thead><tr><th>策略</th><th>来源</th><th>预期影响</th><th>风险</th><th>操作</th></tr></thead><tbody><tr v-for="strategy in pendingStrategies" :key="strategy.id"><td>{{ strategy.title }}</td><td>{{ strategy.source }}</td><td>{{ strategy.expectedImpact }}</td><td><span :class="['risk', strategy.riskLevel]">{{ strategy.riskLevel }}</span></td><td class="actions"><button @click="updateStrategy(strategy.id, 'accepted')">接受</button><button @click="updateStrategy(strategy.id, 'deferred')">暂缓</button><button class="danger-btn" @click="updateStrategy(strategy.id, 'rejected')">驳回</button></td></tr></tbody></table></section>
+          </div>
+        </template>
+        <template v-else-if="currentPath === '/agents'"><div class="agent-grid"><article v-for="agent in workspace?.agents" :key="agent.id" class="agent-card"><div class="panel-header"><h2>{{ agent.name }}</h2><span :class="['status-pill', agent.status]">{{ agentStatusText[agent.status] }}</span></div><p>{{ agent.role }}</p><ul><li v-for="item in agent.responsibilities" :key="item">{{ item }}</li></ul><div class="agent-meta"><span>今日任务 {{ agent.tasks.length }}</span><span>最近产出 {{ agent.outputs[0]?.title }}</span></div><button class="primary-btn" @click="openAgent(agent.id)">进入工作台</button></article></div></template>
+        <template v-else-if="currentPath.startsWith('/agents/') && selectedAgent"><section class="agent-workbench"><div class="panel hero-panel"><div><p class="eyebrow">Digital Worker</p><h2>{{ selectedAgent.name }}</h2><p>{{ selectedAgent.responsibilities.join(' / ') }}</p></div><div class="hero-actions"><button class="primary-btn" @click="runAgent(selectedAgent)">启动巡检</button><button class="secondary-btn" @click="completeAgentOutput(selectedAgent, `${selectedAgent.name}最新报告`)">生成报告</button></div></div><div v-if="selectedAgent.id === 'store-analyst'" class="two-column"><section class="panel"><h2>数据概览</h2><div class="metric-grid compact"><article v-for="card in metricCards.slice(0, 4)" :key="card.label" class="metric-card"><span>{{ card.label }}</span><strong>{{ card.value }}</strong><em>{{ card.trend }}</em></article></div></section><section class="panel"><h2>异常发现</h2><div class="list-item"><strong>转化率下滑 0.6pt</strong><p>流量增长快于成交增长，主图点击后承接不足。</p></div><div class="list-item"><strong>退款率升高</strong><p>真丝衬衫尺码投诉集中，需要补充尺码建议。</p></div></section><section class="panel wide"><h2>历史日报</h2><table><tbody><tr v-for="report in workspace?.reports.filter((report) => report.type === 'daily')" :key="report.id"><td>{{ report.title }}</td><td>{{ report.summary }}</td><td>{{ report.createdAt }}</td></tr></tbody></table></section></div><div v-else-if="selectedAgent.id === 'product-assistant'" class="two-column"><section class="panel wide"><h2>商品列表与分层</h2><table><thead><tr><th>商品</th><th>分层</th><th>销量</th><th>转化</th><th>优化建议</th></tr></thead><tbody><tr v-for="product in workspace?.products" :key="product.id"><td>{{ product.name }}</td><td>{{ product.layer }}</td><td>{{ product.sales }}</td><td>{{ product.conversionRate }}%</td><td>{{ product.aiSuggestion }}</td></tr></tbody></table></section><section class="panel"><h2>问题商品</h2><div v-for="product in workspace?.products.filter((item) => item.layer === '滞销品' || item.riskLevel !== 'low')" :key="product.id" class="list-item"><strong>{{ product.name }}</strong><p>{{ product.riskReason }}</p></div></section></div><div v-else-if="selectedAgent.id === 'inventory-inspector'" class="panel"><h2>风险 SKU 表</h2><table><thead><tr><th>SKU</th><th>商品</th><th>库存</th><th>风险等级</th><th>风险原因</th><th>建议动作</th></tr></thead><tbody><tr v-for="product in workspace?.products" :key="product.id"><td>{{ product.sku }}</td><td>{{ product.name }}</td><td>{{ product.stock }}</td><td><span :class="['risk', product.riskLevel]">{{ riskLabel(product) }}</span></td><td>{{ product.riskReason }}</td><td>{{ product.aiSuggestion }}</td></tr></tbody></table><button class="secondary-btn table-action">导出库存风险报告</button></div><div v-else-if="selectedAgent.id === 'campaign-reviewer'" class="panel"><h2>活动复盘工作台</h2><table><thead><tr><th>活动</th><th>评分</th><th>ROI</th><th>GMV</th><th>转化变化</th><th>下次建议</th></tr></thead><tbody><tr v-for="campaign in workspace?.campaigns" :key="campaign.id"><td>{{ campaign.name }}</td><td>{{ campaign.score }}</td><td>{{ campaign.roi }}</td><td>{{ money(campaign.gmv) }}</td><td>{{ campaign.conversionChange }}pt</td><td>{{ campaign.conclusion }}</td></tr></tbody></table></div><div v-else class="two-column"><section class="panel"><h2>报告中心</h2><div v-for="report in workspace?.reports" :key="report.id" class="list-item"><strong>{{ report.title }}</strong><p>{{ report.summary }}</p></div></section><section class="panel"><h2>知识库与历史策略</h2><div v-for="strategy in workspace?.strategies" :key="strategy.id" class="list-item"><strong>{{ strategy.title }}</strong><span>{{ strategy.source }} · {{ strategy.status }}</span></div><div class="button-row"><button class="secondary-btn">生成周报</button><button class="secondary-btn">生成月报</button></div></section></div></section></template>
+        <template v-else-if="currentPath === '/reports'"><div class="two-column"><section class="panel"><div class="panel-header"><h2>经营报告中心</h2><button class="primary-btn" :disabled="isRunningJob" @click="runWeeklyReport">{{ isRunningJob ? '正在分析数据...' : '生成管理层周报' }}</button></div><p v-if="!workspace?.reports.length" class="summary-text">暂无经营报告，点击“生成管理层周报”创建第一份报告。</p><div v-for="report in workspace?.reports" :key="report.id" :class="['report-row', { active: selectedReportId === report.id }]" @click="openReportDetail(report.id)"><span>{{ reportTypeLabel(report.type) }}</span><strong>{{ report.title }}</strong><p>{{ report.summary }}</p><em>{{ report.createdAt }} · {{ report.status }}</em><button class="secondary-btn" @click.stop="openReportDetail(report.id)">查看详情</button></div></section><section class="panel"><h2>报告详情</h2><template v-if="selectedReport"><span class="status-pill">{{ reportTypeLabel(selectedReport.type) }} · {{ selectedReport.status }}</span><h3>{{ selectedReport.title }}</h3><p>{{ selectedReport.summary }}</p><em>{{ selectedReport.createdAt }}</em><pre class="report-detail-text">{{ selectedReportContent }}</pre></template><p v-else class="summary-text">点击左侧报告查看完整内容。</p></section></div></template>
+        <template v-else-if="currentPath === '/products'"><section class="panel"><div class="panel-header"><h2>商品分析</h2><button class="secondary-btn" :disabled="isRunningJob" @click="runProductAnalysis">{{ isRunningJob ? '正在分析数据...' : '生成商品优化方案' }}</button></div><table><thead><tr><th>商品</th><th>SKU</th><th>价格</th><th>库存</th><th>销量</th><th>转化率</th><th>分层</th><th>AI 建议</th></tr></thead><tbody><tr v-for="product in workspace?.products" :key="product.id"><td>{{ product.name }}</td><td>{{ product.sku }}</td><td>{{ money(product.price) }}</td><td>{{ product.stock }}</td><td>{{ product.sales }}</td><td>{{ product.conversionRate }}%</td><td>{{ product.layer }}</td><td>{{ product.aiSuggestion }}</td></tr></tbody></table></section></template>
+        <template v-else-if="currentPath === '/inventory'"><section class="panel"><div class="panel-header"><h2>库存风险</h2><button class="primary-btn" :disabled="isRunningJob" @click="runReplenishmentPlan">{{ isRunningJob ? '正在分析数据...' : '生成补货建议' }}</button></div><table><thead><tr><th>SKU</th><th>商品</th><th>库存</th><th>风险等级</th><th>风险原因</th><th>建议动作</th></tr></thead><tbody><tr v-for="product in workspace?.products" :key="product.id"><td>{{ product.sku }}</td><td>{{ product.name }}</td><td>{{ product.stock }}</td><td><span :class="['risk', product.riskLevel]">{{ riskLabel(product) }}</span></td><td>{{ product.riskReason }}</td><td>{{ product.aiSuggestion }}</td></tr></tbody></table></section></template>
+        <template v-else-if="currentPath === '/campaigns'"><section class="panel"><div class="panel-header"><h2>活动复盘</h2><button class="primary-btn" :disabled="isRunningJob" @click="runCampaignReview">{{ isRunningJob ? '正在分析数据...' : '生成复盘报告' }}</button></div><p v-if="!workspace?.campaigns.length" class="summary-text">当前没有可复盘的活动数据，导入活动或订单数据后可生成复盘报告。</p><table v-else><thead><tr><th>活动</th><th>效果评分</th><th>ROI</th><th>GMV</th><th>转化变化</th><th>AI 复盘结论</th></tr></thead><tbody><tr v-for="campaign in workspace?.campaigns" :key="campaign.id"><td>{{ campaign.name }}</td><td>{{ campaign.score }}</td><td>{{ campaign.roi }}</td><td>{{ money(campaign.gmv) }}</td><td>{{ campaign.conversionChange }}pt</td><td>{{ campaign.conclusion }}</td></tr></tbody></table></section></template>
+        <template v-else-if="currentPath === '/shops'"><div class="two-column"><section class="panel wide"><div class="panel-header"><h2>店铺列表</h2><button class="secondary-btn" @click="editingShopId = null">新建店铺</button></div><table><thead><tr><th>店铺</th><th>平台</th><th>阶段</th><th>授权</th><th>数据导入</th><th>最近同步</th><th>操作</th></tr></thead><tbody><tr v-for="shop in workspace?.shops" :key="shop.id"><td><strong>{{ shop.name }}</strong></td><td>{{ shop.platform }}</td><td>{{ shop.businessStage }}</td><td>{{ shop.status }}</td><td>{{ shop.importStatus }}</td><td>{{ shop.lastSyncAt }}</td><td class="actions"><button @click="switchShop(shop.id)">设为当前</button><button @click="startEditShop(shop)">编辑</button><button class="danger-btn" @click="deleteShop(shop.id)">删除</button></td></tr></tbody></table></section><section class="panel"><h2>{{ editingShopId ? '编辑店铺' : '新建店铺' }}</h2><div class="form-stack"><label>店铺名称<input v-model="shopDraft.name" /></label><label>主营类目<input v-model="shopDraft.category" /></label><label>平台<select v-model="shopDraft.platform"><option v-for="platform in platformOptions" :key="platform">{{ platform }}</option></select></label><label>店铺类型<select v-model="shopDraft.type"><option>品牌自营</option><option>代运营</option><option>分销</option><option>其他</option></select></label><label>经营阶段<select v-model="shopDraft.businessStage"><option>冷启动</option><option>成长期</option><option>稳定期</option><option>下滑期</option></select></label><button class="primary-btn" @click="saveShop">保存店铺</button></div></section></div></template>
+        <template v-else-if="currentPath === '/integrations'"><div class="integration-grid"><article v-for="integration in workspace?.integrations" :key="integration.id" class="integration-card"><div class="panel-header"><h2>{{ integration.platform }}</h2><span :class="['status-pill', integration.status]">{{ statusText[integration.status] }}</span></div><p>最近同步：{{ integration.lastSyncAt }}</p><p v-if="integration.errorMessage" class="error-text">{{ integration.errorMessage }}</p><div class="button-row"><button class="primary-btn" @click="setIntegrationStatus(integration, 'authorized')">{{ integration.status === 'authorized' ? '重新授权' : '立即授权' }}</button><button class="secondary-btn" @click="setIntegrationStatus(integration, 'syncing')">开始同步</button><button class="secondary-btn">查看同步日志</button></div></article></div></template>
+        <template v-else-if="currentPath === '/data-import'">
+          <div class="two-column">
+            <section class="panel">
+              <h2>导入经营数据</h2>
+              <div class="choice-grid vertical">
+                <button :class="{ active: selectedImportMode === 'sample' }" @click="selectedImportMode = 'sample'">使用示例数据<span>最快体验完整巡检闭环</span></button>
+                <button :class="{ active: selectedImportMode === 'upload' }" @click="selectedImportMode = 'upload'">上传 Excel / CSV<span>订单、商品、库存、活动数据</span></button>
+                <button :class="{ active: selectedImportMode === 'paste' }" @click="selectedImportMode = 'paste'">粘贴数据<span>从表格复制后自动识别字段</span></button>
               </div>
-            </div>
-            <p>{{ card.desc }}</p>
-            <div class="quick-task-list">
-              <button v-for="task in card.tasks" :key="task.title" class="quick-task" @click="setQuickTask(task.prompt)" @dblclick="runQuickTask(task.prompt)">
-                <strong>{{ task.title }}</strong>
-                <span>{{ task.desc }}</span>
-              </button>
-            </div>
-          </section>
-        </div>
-      </div>
-
-      <!-- Chat Area -->
-      <div v-else class="chat-scroll-area">
-        <div class="chat-container">
-          <div v-for="(msg, index) in messages" :key="index" class="message-wrapper" :class="msg.role">
-            
-            <!-- User Message -->
-            <div v-if="msg.role === 'user'" class="message-user">
-              <div class="msg-content">{{ msg.content }}</div>
-            </div>
-
-            <!-- AI Message -->
-            <div v-else-if="msg.role === 'ai'" class="message-ai">
-              <div class="ai-avatar">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z" fill="url(#grad1)"/>
-                  <defs>
-                    <linearGradient id="grad1" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
-                      <stop stop-color="#4E75F6"/>
-                      <stop offset="1" stop-color="#E3557A"/>
-                    </linearGradient>
-                  </defs>
-                </svg>
+              <label v-if="selectedImportMode === 'upload'" class="file-picker">选择 Excel / CSV 文件<input type="file" accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" @change="handleImportFileChange" /></label>
+              <div class="button-row">
+                <button class="primary-btn" :disabled="isImporting" @click="executeImport">{{ isImporting ? '处理中...' : '执行导入' }}</button>
+                <button v-if="pendingImportJobId" class="secondary-btn" :disabled="isImporting" @click="confirmUploadedImport">确认入库</button>
               </div>
-              
-              <div class="ai-content-wrapper">
-                <!-- Logs / Thinking Process -->
-                <div v-if="msg.logs && msg.logs.length > 0" class="process-section">
-                  <details>
-                    <summary>
-                      <span class="spinner" v-if="status === 'running' && index === messages.length - 1"></span>
-                      View thought process
-                    </summary>
-                    <div class="process-steps">
-                      <div v-for="(log, idx) in msg.logs" :key="idx" class="step-item">
-                        <div class="step-header">
-                          <span class="step-icon">🔧</span>
-                          <span class="step-title">{{ log.title }}</span>
-                        </div>
-                        <div class="step-details" v-if="log.details">
-                           <pre>{{ JSON.stringify(log.details, null, 2) }}</pre>
-                        </div>
-                      </div>
-                    </div>
-                  </details>
-                </div>
-
-                <!-- Text Content -->
-                <div class="markdown-body" v-html="renderMarkdown(msg.content)"></div>
-
-                <div v-if="msg.interrupt" class="interrupt-panel">
-                  <div class="interrupt-title">需要人工决策</div>
-                  <pre>{{ msg.interrupt.summary }}</pre>
-                  <textarea
-                    v-model="resumeInstruction"
-                    placeholder="可选：输入新的执行策略，例如只查数据库并直接给阶段性结论"
-                  ></textarea>
-                  <div class="interrupt-actions">
-                    <button @click="resumeTask('continue')">继续</button>
-                    <button @click="resumeTask('revise')">按新策略恢复</button>
-                    <button class="danger" @click="resumeTask('abort')">终止</button>
-                  </div>
-                </div>
-
-                <!-- Files -->
-                <div v-if="msg.files && msg.files.length > 0" class="files-grid">
-                  <a v-for="file in msg.files" :key="file.name" :href="file.url" target="_blank" class="file-card" :download="file.name">
-                    <div class="file-icon">📄</div>
-                    <div class="file-info">
-                      <div class="file-name">{{ file.name }}</div>
-                      <div class="file-type">Document</div>
-                    </div>
-                  </a>
-                </div>
-              </div>
-            </div>
-
-            <!-- System Message -->
-             <div v-else class="message-system">
-              {{ msg.content }}
-            </div>
-
+              <p v-if="importNotice" class="success-text">{{ importNotice }}</p>
+            </section>
+            <section class="panel wide">
+              <h2>字段映射与质量检测</h2>
+              <div v-if="importPreview" class="mapping-table"><span>源字段</span><span>目标字段</span><span>状态</span><template v-for="field in importPreview.fields" :key="field.sourceField"><span>{{ field.sourceField }}</span><span>{{ field.targetField }}</span><span>{{ Math.round(field.confidence * 100) }}%</span></template></div>
+              <div v-else class="mapping-table"><span>源字段</span><span>目标字段</span><span>状态</span><span>order_id</span><span>订单号</span><span>已匹配</span><span>sku_code</span><span>商品 SKU</span><span>已匹配</span><span>pay_amount</span><span>成交金额</span><span>已匹配</span><span>refund_flag</span><span>退款状态</span><span>建议确认</span></div>
+              <div v-if="importPreview" class="preview-table"><h2>上传预览</h2><table><thead><tr><th v-for="field in importPreview.fields.slice(0, 6)" :key="field.sourceField">{{ field.sourceField }}</th></tr></thead><tbody><tr v-for="(row, index) in importPreview.rows.slice(0, 5)" :key="index"><td v-for="field in importPreview.fields.slice(0, 6)" :key="field.sourceField">{{ row[field.sourceField] }}</td></tr></tbody></table></div>
+              <h2>导入历史</h2>
+              <table><thead><tr><th>来源</th><th>文件</th><th>行数</th><th>状态</th><th>质量分</th><th>时间</th></tr></thead><tbody><tr v-for="record in workspace?.imports" :key="record.id"><td>{{ record.source }}</td><td>{{ record.fileName }}</td><td>{{ record.rows }}</td><td>{{ record.status }}</td><td>{{ record.qualityScore }}</td><td>{{ record.createdAt }}</td></tr></tbody></table>
+            </section>
           </div>
-          <div ref="messagesEndRef" class="spacer-bottom"></div>
-        </div>
-      </div>
-
-      <!-- Input Area -->
-      <footer class="input-footer">
-        <!-- File Preview Tab -->
-        <div v-if="selectedFiles.length > 0" class="file-preview-container">
-          <div v-for="(file, index) in selectedFiles" :key="index" class="file-preview-chip">
-            <span class="file-preview-icon">📎</span>
-            <span class="file-preview-name">{{ file.name }}</span>
-            <button class="file-remove-btn" @click="removeFile(index)" title="Remove file">×</button>
-          </div>
-        </div>
-
-        <div class="input-container" :class="{ focused: status === 'running' }">
-          <input 
-            type="file" 
-            ref="fileInputRef" 
-            multiple
-            style="display: none" 
-            @change="handleFileChange" 
-          />
-          <button class="upload-btn" @click="triggerFileUpload" :disabled="status === 'running'" title="Upload file">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </button>
-          <textarea 
-            v-model="inputQuery" 
-            @keydown.enter.exact.prevent="sendMessage"
-            placeholder="输入电商运营任务，例如：生成昨日店铺经营日报"
-            :disabled="status === 'running'"
-          ></textarea>
-          <button class="send-btn" @click="sendMessage" :disabled="!isAuthenticated || (!inputQuery.trim() && status !== 'running')">
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path>
-            </svg>
-          </button>
-        </div>
-        <div class="footer-text">
-          电商数字员工会结合数据库、知识库和外部信息生成建议，关键经营决策请结合业务事实复核。
-        </div>
-      </footer>
-    </main>
-
-    <!-- Right Sidebar (File Explorer) -->
-    <aside v-if="isSidebarOpen" class="file-sidebar">
-      <div class="sidebar-header">
-        <h3>Session Files</h3>
-        <div style="display: flex; gap: 8px; align-items: center;">
-            <button class="folder-btn" @click="fetchFiles" title="Refresh Files" style="padding: 4px 8px;">
-                ↻
-            </button>
-            <button class="close-btn" @click="isSidebarOpen = false">×</button>
-        </div>
-      </div>
-      <div class="file-list">
-        <div v-if="fileList.length === 0" class="empty-files">
-          No files generated yet.
-        </div>
-        <div v-else v-for="file in fileList" :key="file.path" class="file-item">
-          <a :href="file.url" target="_blank" class="file-link" :download="file.name">
-            <span class="file-icon">📄</span>
-            <span class="file-name-text">{{ file.name }}</span>
-          </a>
-        </div>
-      </div>
-    </aside>
-  </div>
+        </template>
+        <template v-else-if="currentPath === '/ai-chat'"><section class="ai-chat-page"><div class="panel ai-chat-intro"><div><p class="eyebrow">Assistant</p><h2>AI 对话助手</h2><p>这是辅助入口，用来直接追问经营分析、商品优化、库存风险、活动复盘和报告写作，不替代数字员工工作流。</p></div><button class="secondary-btn" @click="clearChat">清空对话</button></div><div class="ai-chat-layout"><section class="panel chat-panel"><div class="chat-message-list"><div v-for="(message, index) in chatMessages" :key="index" :class="['chat-message', message.role]"><span>{{ message.role === 'assistant' ? 'AI' : user?.name.slice(0, 1) }}</span><p>{{ message.content }}</p></div></div><form class="chat-composer" @submit.prevent="sendChatMessage"><textarea v-model="chatDraft" placeholder="直接输入问题，例如：今天哪些 SKU 需要优先补货？" @keydown.enter.exact.prevent="sendChatMessage"></textarea><button class="primary-btn" type="submit">发送</button></form></section><aside class="panel chat-suggestions"><h2>可直接询问</h2><button @click="chatDraft = '昨日经营日报有哪些异常？'; sendChatMessage()">昨日经营异常</button><button @click="chatDraft = '哪些库存风险 SKU 需要优先处理？'; sendChatMessage()">库存风险优先级</button><button @click="chatDraft = '最近活动复盘结论是什么？'; sendChatMessage()">活动复盘结论</button><button @click="chatDraft = '哪个商品最值得优化？'; sendChatMessage()">商品优化建议</button></aside></div></section></template>
+        <template v-else-if="currentPath === '/account'"><div class="two-column"><section class="panel"><h2>个人资料</h2><div class="profile-list"><span>姓名</span><strong>{{ user?.name }}</strong><span>邮箱 / 手机</span><strong>{{ user?.email }}</strong><span>角色</span><strong>{{ user?.role }}</strong><span>创建时间</span><strong>{{ user?.createdAt.slice(0, 10) }}</strong></div></section><section class="panel"><h2>企业资料</h2><div class="profile-list"><span>企业</span><strong>{{ user?.companyName }}</strong><span>当前套餐</span><strong>{{ user?.plan }}</strong><span>API / 数据权限</span><strong>订单、商品、库存、活动只读</strong></div></section><section class="panel"><h2>登录安全</h2><div class="setting-row"><span>密码登录</span><button class="secondary-btn">修改密码</button></div><div class="setting-row"><span>两步验证</span><button class="secondary-btn">开启</button></div></section><section class="panel"><h2>通知设置</h2><div class="setting-row"><span>库存高风险提醒</span><input type="checkbox" checked /></div><div class="setting-row"><span>日报生成通知</span><input type="checkbox" checked /></div><button class="danger-btn" @click="logout">退出登录</button></section></div></template>
+      </section>
+    </section>
+  </main>
 </template>
-
-<style>
-/* Global Resets & Variables */
-:root {
-  --bg-dark: #11130f;
-  --surface-dark: #1b1f19;
-  --surface-light: #293026;
-  --text-primary: #f0f4ea;
-  --text-secondary: #b9c4b0;
-  --accent-blue: #9bd16f;
-  --accent-gold: #f0b84b;
-  --user-msg-bg: #263021;
-  --border-color: #3b4635;
-}
-
-body {
-  margin: 0;
-  background-color: var(--bg-dark);
-  color: var(--text-primary);
-  font-family: 'Google Sans', 'Roboto', Helvetica, Arial, sans-serif;
-  overflow: hidden; /* App handles scroll */
-}
-
-/* Layout */
-.app-container {
-  display: flex;
-  height: 100vh;
-  width: 100vw;
-  /* justify-content: center; Removed to allow sidebar layout */
-}
-
-/* Main Content */
-.main-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  position: relative;
-  background-color: var(--bg-dark);
-  min-width: 0; /* Prevent flex overflow */
-}
-
-.auth-strip {
-  width: 100%;
-  min-height: 56px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0.75rem 1rem 0;
-  box-sizing: border-box;
-  z-index: 20;
-}
-
-.auth-fields {
-  max-width: 920px;
-  width: min(920px, calc(100% - 24px));
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  padding: 0.5rem;
-  border: 1px solid rgba(155, 209, 111, 0.18);
-  border-radius: 10px;
-  background: rgba(27, 31, 25, 0.88);
-}
-
-.auth-fields input {
-  min-width: 150px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: rgba(17, 19, 15, 0.82);
-  color: var(--text-primary);
-  padding: 0.55rem 0.7rem;
-  outline: none;
-}
-
-.auth-fields button {
-  border: 1px solid rgba(155, 209, 111, 0.38);
-  border-radius: 8px;
-  background: rgba(155, 209, 111, 0.14);
-  color: var(--text-primary);
-  padding: 0.55rem 0.85rem;
-  cursor: pointer;
-}
-
-.auth-badge {
-  color: var(--accent-blue);
-  font-size: 0.86rem;
-  font-weight: 700;
-  padding: 0 0.35rem;
-}
-
-.auth-error {
-  color: #ff8a8a;
-  font-size: 0.84rem;
-}
-
-.sidebar-toggle-btn {
-  position: absolute;
-  top: 1rem;
-  right: 1rem;
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  z-index: 10;
-  padding: 8px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.sidebar-toggle-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: var(--text-primary);
-}
-
-/* File Sidebar */
-.file-sidebar {
-  width: 300px;
-  background-color: var(--surface-dark);
-  border-left: 1px solid var(--border-color);
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-}
-
-.sidebar-header {
-  padding: 1rem;
-  border-bottom: 1px solid var(--border-color);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.sidebar-header h3 {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 500;
-  color: var(--text-primary);
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 1.5rem;
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-}
-
-.close-btn:hover {
-  color: var(--text-primary);
-}
-
-.file-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 1rem;
-}
-
-.empty-files {
-  color: var(--text-secondary);
-  text-align: center;
-  font-size: 0.9rem;
-  margin-top: 2rem;
-}
-
-.file-item {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.5rem;
-}
-
-.file-link {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.75rem;
-  border-radius: 8px;
-  color: var(--text-primary);
-  text-decoration: none;
-  transition: background 0.2s;
-  border: 1px solid transparent;
-}
-
-.file-link:hover {
-  background: #2D2E30;
-  border-color: #444;
-}
-
-.folder-btn {
-  background: transparent;
-  border: 1px solid var(--border-color);
-  color: var(--text-secondary);
-  cursor: pointer;
-  padding: 0.5rem;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.folder-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: var(--text-primary);
-  border-color: var(--text-secondary);
-}
-
-.file-name-text {
-  font-size: 0.9rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Welcome Screen */
-.welcome-screen {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-start;
-  align-items: center;
-  width: min(1120px, calc(100% - 48px));
-  padding: 4rem 0 2rem;
-  gap: 1.5rem;
-}
-
-/* Centered Layout Mode (Initial State) */
-.main-content.centered-layout {
-  justify-content: center;
-  align-items: center;
-  overflow-y: auto;
-}
-
-.main-content.centered-layout .welcome-screen {
-  flex: 0 0 auto;
-  padding-bottom: 2rem;
-}
-
-.main-content.centered-layout .input-footer {
-  width: 100%;
-  max-width: 100%;
-  padding: 0;
-  background: transparent;
-  justify-content: center;
-}
-
-.commerce-hero {
-  width: 100%;
-  display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
-  gap: 1rem;
-  align-items: stretch;
-}
-
-.hero-copy,
-.hero-status,
-.work-card {
-  border: 1px solid rgba(155, 209, 111, 0.18);
-  background: linear-gradient(145deg, rgba(32, 39, 28, 0.96), rgba(20, 24, 18, 0.98));
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22);
-}
-
-.hero-copy {
-  padding: 2rem;
-  border-radius: 14px;
-}
-
-.eyebrow {
-  display: inline-flex;
-  color: var(--accent-gold);
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  margin-bottom: 0.75rem;
-}
-
-.hero-copy h1 {
-  margin: 0;
-  font-size: clamp(2.25rem, 5vw, 4.5rem);
-  line-height: 1.05;
-  color: var(--text-primary);
-}
-
-.hero-copy p {
-  max-width: 680px;
-  margin: 1rem 0 0;
-  color: var(--text-secondary);
-  font-size: 1.05rem;
-  line-height: 1.75;
-}
-
-.hero-status {
-  border-radius: 14px;
-  padding: 1rem;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
-}
-
-.status-tile {
-  min-height: 92px;
-  border-radius: 10px;
-  background: rgba(240, 244, 234, 0.055);
-  border: 1px solid rgba(240, 244, 234, 0.08);
-  padding: 1rem;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-}
-
-.status-tile span {
-  color: var(--text-secondary);
-  font-size: 0.86rem;
-}
-
-.status-tile strong {
-  color: var(--accent-blue);
-  font-size: 1.1rem;
-}
-
-.workbench-grid {
-  width: 100%;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 1rem;
-}
-
-.work-card {
-  border-radius: 12px;
-  padding: 1rem;
-  display: flex;
-  flex-direction: column;
-  min-height: 260px;
-}
-
-.work-card-header h2 {
-  margin: 0;
-  font-size: 1.05rem;
-  color: var(--text-primary);
-}
-
-.work-card-header span {
-  display: inline-flex;
-  margin-top: 0.35rem;
-  color: var(--accent-gold);
-  font-size: 0.78rem;
-}
-
-.work-card p {
-  margin: 0.85rem 0 1rem;
-  color: var(--text-secondary);
-  font-size: 0.9rem;
-  line-height: 1.55;
-}
-
-.quick-task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
-  margin-top: auto;
-}
-
-.quick-task {
-  text-align: left;
-  border: 1px solid rgba(240, 244, 234, 0.09);
-  border-radius: 9px;
-  background: rgba(240, 244, 234, 0.045);
-  color: var(--text-primary);
-  padding: 0.75rem;
-  cursor: pointer;
-  transition: border-color 0.18s, background 0.18s, transform 0.18s;
-}
-
-.quick-task:hover {
-  border-color: rgba(155, 209, 111, 0.45);
-  background: rgba(155, 209, 111, 0.09);
-  transform: translateY(-1px);
-}
-
-.quick-task strong,
-.quick-task span {
-  display: block;
-}
-
-.quick-task strong {
-  font-size: 0.9rem;
-}
-
-.quick-task span {
-  color: var(--text-secondary);
-  font-size: 0.78rem;
-  margin-top: 0.2rem;
-}
-
-/* Chat Area */
-.chat-scroll-area {
-  flex: 1;
-  overflow-y: auto;
-  padding: 1rem;
-}
-
-.chat-container {
-  max-width: 800px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2rem;
-}
-
-.message-wrapper {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-}
-
-/* User Message */
-.message-user {
-  align-self: flex-end;
-  max-width: 70%;
-}
-
-.msg-content {
-  background-color: var(--user-msg-bg);
-  padding: 12px 18px;
-  border-radius: 18px;
-  border-bottom-right-radius: 4px;
-  line-height: 1.6;
-}
-
-/* AI Message */
-.message-ai {
-  align-self: flex-start;
-  width: 100%;
-  display: flex;
-  gap: 1rem;
-}
-
-.ai-avatar {
-  flex-shrink: 0;
-  width: 28px;
-  height: 28px;
-  margin-top: 4px;
-}
-
-.ai-content-wrapper {
-  flex: 1;
-  min-width: 0; /* Text wrap fix */
-}
-
-.markdown-body {
-  line-height: 1.6;
-  font-size: 1rem;
-  overflow-x: auto;
-}
-
-.markdown-body pre {
-  background: #2D2E30;
-  padding: 1rem;
-  border-radius: 8px;
-  overflow-x: auto;
-}
-
-.markdown-body table {
-  width: max-content;
-  max-width: 100%;
-  border-collapse: collapse;
-  margin: 1rem 0;
-  font-size: 0.9rem;
-}
-
-.markdown-body th,
-.markdown-body td {
-  border: 1px solid var(--border-color);
-  padding: 0.55rem 0.7rem;
-  vertical-align: top;
-  text-align: left;
-  white-space: nowrap;
-}
-
-.markdown-body th {
-  background: rgba(155, 209, 111, 0.12);
-  color: var(--text-primary);
-  font-weight: 700;
-}
-
-.markdown-body td {
-  color: var(--text-secondary);
-}
-
-.interrupt-panel {
-  margin-top: 1rem;
-  border: 1px solid rgba(240, 184, 75, 0.35);
-  background: rgba(240, 184, 75, 0.08);
-  border-radius: 10px;
-  padding: 1rem;
-}
-
-.interrupt-title {
-  color: var(--accent-gold);
-  font-weight: 700;
-  margin-bottom: 0.75rem;
-}
-
-.interrupt-panel pre {
-  white-space: pre-wrap;
-  color: var(--text-secondary);
-  font-size: 0.86rem;
-  line-height: 1.5;
-  margin: 0 0 0.75rem;
-}
-
-.interrupt-panel textarea {
-  width: 100%;
-  min-height: 72px;
-  box-sizing: border-box;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: rgba(17, 19, 15, 0.78);
-  color: var(--text-primary);
-  padding: 0.75rem;
-  resize: vertical;
-}
-
-.interrupt-actions {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  margin-top: 0.75rem;
-}
-
-.interrupt-actions button {
-  border: 1px solid rgba(155, 209, 111, 0.35);
-  background: rgba(155, 209, 111, 0.12);
-  color: var(--text-primary);
-  border-radius: 8px;
-  padding: 0.55rem 0.8rem;
-  cursor: pointer;
-}
-
-.interrupt-actions button.danger {
-  border-color: rgba(227, 85, 122, 0.45);
-  background: rgba(227, 85, 122, 0.12);
-}
-
-.typing-indicator {
-  color: var(--text-secondary);
-  font-style: italic;
-  animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-  0% { opacity: 0.5; }
-  50% { opacity: 1; }
-  100% { opacity: 0.5; }
-}
-
-/* Process / Logs */
-.process-section {
-  margin-bottom: 1rem;
-}
-
-.process-section summary {
-  cursor: pointer;
-  color: var(--text-secondary);
-  font-size: 0.85rem;
-  list-style: none; /* Hide default arrow */
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem;
-  border-radius: 4px;
-}
-
-.process-section summary:hover {
-  background: #2D2E30;
-}
-
-.spinner {
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--text-secondary);
-  border-top-color: transparent;
-  border-radius: 50%;
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin { to { transform: rotate(360deg); } }
-
-.process-steps {
-  background: #1E1F20;
-  border-radius: 8px;
-  padding: 0.5rem;
-  margin-top: 0.5rem;
-  border: 1px solid #333;
-}
-
-.step-item {
-  padding: 0.5rem;
-  border-left: 2px solid #333;
-  margin-left: 0.5rem;
-  margin-bottom: 0.5rem;
-}
-
-.step-header {
-  font-size: 0.85rem;
-  font-weight: 500;
-  color: #E3E3E3;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.step-details pre {
-  margin: 0.5rem 0 0 0;
-  font-size: 0.75rem;
-  color: #999;
-  background: #111;
-  padding: 0.5rem;
-  border-radius: 4px;
-  overflow-x: auto;
-}
-
-/* Files Grid */
-.files-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-top: 1rem;
-}
-
-.file-card {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  background: #2D2E30;
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  text-decoration: none;
-  color: var(--text-primary);
-  border: 1px solid #444;
-  transition: all 0.2s;
-  min-width: 150px;
-}
-
-.file-card:hover {
-  background: #333537;
-  border-color: #666;
-}
-
-.file-info {
-  display: flex;
-  flex-direction: column;
-}
-
-.file-name {
-  font-weight: 500;
-  font-size: 0.9rem;
-}
-
-.file-type {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-}
-
-/* System Message */
-.message-system {
-  text-align: center;
-  font-size: 0.8rem;
-  color: #666;
-  margin: 1rem 0;
-}
-
-.spacer-bottom { height: 100px; }
-
-/* Input Footer */
-.input-footer {
-  background: var(--bg-dark); /* Ensure it covers scrolling content */
-  padding: 1rem 2rem 2rem 2rem;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.input-container {
-  width: 100%;
-  max-width: 800px;
-  background: #1E1F20;
-  border-radius: 32px;
-  display: flex;
-  align-items: center;
-  padding: 0.5rem 1rem;
-  transition: background 0.2s;
-}
-
-.input-container.focused {
-  background: #2D2E30;
-}
-
-textarea {
-  flex: 1;
-  background: transparent;
-  border: none;
-  color: var(--text-primary);
-  font-size: 1rem;
-  padding: 10px;
-  resize: none;
-  height: 24px;
-  max-height: 200px;
-  font-family: inherit;
-  outline: none;
-}
-
-.send-btn {
-  background: none;
-  border: none;
-  color: var(--text-primary); /* White when active */
-  cursor: pointer;
-  padding: 8px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.send-btn:disabled {
-  color: #444746;
-  cursor: default;
-}
-
-.send-btn:not(:disabled):hover {
-  background: #3c4043;
-}
-
-.upload-btn {
-  background: none;
-  border: none;
-  color: var(--text-primary);
-  cursor: pointer;
-  padding: 8px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-right: 4px;
-}
-
-.upload-btn:hover {
-  background: #3c4043;
-}
-
-.upload-btn:disabled {
-  color: #444746;
-  cursor: default;
-}
-
-.footer-text {
-  font-size: 0.75rem;
-  color: #444746;
-  text-align: center;
-}
-
-/* File Preview Styles */
-.file-preview-container {
-  width: 100%;
-  max-width: 800px;
-  display: flex;
-  justify-content: flex-start;
-  padding-left: 1rem;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.file-preview-chip {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  background: #2D2E30;
-  padding: 0.5rem 0.75rem;
-  border-radius: 8px;
-  border: 1px solid #444;
-  font-size: 0.9rem;
-  color: var(--text-primary);
-  animation: slideUp 0.2s ease-out;
-}
-
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.file-preview-icon {
-  font-size: 1rem;
-}
-
-.file-preview-name {
-  max-width: 200px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.file-remove-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 1.1rem;
-  padding: 0 4px;
-  line-height: 1;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.file-remove-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: #ff6b6b;
-}
-
-/* Scrollbar Styles */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: #444;
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #555;
-}
-</style>

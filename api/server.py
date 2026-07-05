@@ -25,8 +25,24 @@ from agent.memory.store import get_memory_store, init_memory_store
 from agent.core.tool_registry import tool_registry
 from agent.evolution.policy_review import approve_policy_proposal, list_policy_proposals, reject_policy_proposal
 from agent.observability.trace_reader import build_agent_metrics, build_task_timeline, list_task_traces
+from api.routes import agents, ai_chat, campaigns, dashboard, data_import, integrations, inventory, onboarding, products, reports, shops, workspace
 
 app = FastAPI(title="DeepAgents API")
+
+# 产品化 SaaS 前端所需的业务 API 独立拆到 api/routes 与 api/services。
+# 这里仅挂载 router，不把平台业务继续塞进 server.py，避免入口文件继续膨胀。
+app.include_router(workspace.router)
+app.include_router(dashboard.router)
+app.include_router(products.router)
+app.include_router(inventory.router)
+app.include_router(campaigns.router)
+app.include_router(reports.router)
+app.include_router(agents.router)
+app.include_router(data_import.router)
+app.include_router(shops.router)
+app.include_router(integrations.router)
+app.include_router(onboarding.router)
+app.include_router(ai_chat.router)
 
 # 挂载输出目录，以便前端访问生成的静态文件
 # 假设输出目录位于项目根目录下的 output
@@ -128,6 +144,7 @@ async def startup_event():
 
 async def start_agent_task(payload: dict):
     from agent.main_agent import run_deep_agent
+    from api.services.job_result_service import finalize_agent_job_failure, finalize_agent_job_success
 
     conversation_id = payload["conversation_id"]
     task_id = payload["task_id"]
@@ -139,14 +156,38 @@ async def start_agent_task(payload: dict):
         "user_id": payload["user_id"],
         "shop_id": payload["shop_id"],
     }
-    agent_coroutine = run_deep_agent(
-        payload["query"],
-        conversation_id=conversation_id,
-        task_id=task_id,
-        tenant_id=payload["tenant_id"],
-        user_id=payload["user_id"],
-        shop_id=payload["shop_id"],
-    )
+    async def run_and_finalize():
+        try:
+            final_result = await run_deep_agent(
+                payload["query"],
+                conversation_id=conversation_id,
+                task_id=task_id,
+                tenant_id=payload["tenant_id"],
+                user_id=payload["user_id"],
+                shop_id=payload["shop_id"],
+            )
+            await finalize_agent_job_success(
+                tenant_id=payload["tenant_id"],
+                shop_id=payload["shop_id"],
+                user_id=payload["user_id"],
+                task_id=task_id,
+                conversation_id=conversation_id,
+                final_result=final_result,
+                execution_metadata=metadata,
+            )
+            return final_result
+        except Exception as error:
+            await finalize_agent_job_failure(
+                tenant_id=payload["tenant_id"],
+                shop_id=payload["shop_id"],
+                user_id=payload["user_id"],
+                task_id=task_id,
+                conversation_id=conversation_id,
+                error_message=str(error),
+            )
+            raise
+
+    agent_coroutine = run_and_finalize()
     try:
         await task_runtime.start_and_wait(task_id, payload["query"], agent_coroutine, metadata=metadata)
     except Exception:

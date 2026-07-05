@@ -61,3 +61,14 @@ func (p *BrainProxy) ServeWithPrefixTrim(prefix string) gin.HandlerFunc {
 		p.Serve(c)
 	}
 }
+
+func (p *BrainProxy) ServeWithPrefixReplace(prefix string, replacement string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		trimmedPath := strings.TrimPrefix(c.Request.URL.Path, prefix)
+		if trimmedPath == "" {
+			trimmedPath = "/"
+		}
+		c.Request.URL.Path = strings.TrimRight(replacement, "/") + trimmedPath
+		p.Serve(c)
+	}
+}

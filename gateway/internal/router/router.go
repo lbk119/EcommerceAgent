@@ -16,7 +16,7 @@ import (
 
 func New(cfg config.Config, brainProxy *proxy.BrainProxy, authHandler *handlers.AuthHandler, tokenManager *auth.TokenManager, userStore auth.UserStore, enforcer *casbin.Enforcer) *gin.Engine {
 	engine := gin.New()
-	engine.Use(gin.Recovery(), middleware.RequestID(), middleware.CORS())
+	engine.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.CORS())
 
 	engine.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -38,11 +38,18 @@ func New(cfg config.Config, brainProxy *proxy.BrainProxy, authHandler *handlers.
 func registerAuthRoutes(engine *gin.Engine, authHandler *handlers.AuthHandler, tokenManager *auth.TokenManager, userStore auth.UserStore, enforcer *casbin.Enforcer, authEnabled bool) {
 	v1 := engine.Group("/api/v1")
 	v1.POST("/auth/login", authHandler.Login)
+	v1.POST("/auth/register", authHandler.Register)
 
 	// me/logout 需要有效 token：前端可以用 me 确认当前 token 是否仍能解析为有效用户和租户上下文。
 	authenticated := v1.Group("/auth", protectedMiddleware(tokenManager, userStore, enforcer, authEnabled)...)
 	authenticated.GET("/me", authHandler.Me)
+	authenticated.POST("/shops", authHandler.CreateShop)
 	authenticated.POST("/logout", authHandler.Logout)
+
+	account := v1.Group("/account", protectedMiddleware(tokenManager, userStore, enforcer, authEnabled)...)
+	account.PUT("/profile", authHandler.UpdateProfile)
+	account.PUT("/password", authHandler.UpdatePassword)
+	account.POST("/onboarding-completed", authHandler.MarkOnboardingCompleted)
 }
 
 func registerV1Routes(engine *gin.Engine, brainProxy *proxy.BrainProxy, tokenManager *auth.TokenManager, userStore auth.UserStore, enforcer *casbin.Enforcer, authEnabled bool) {
@@ -50,6 +57,28 @@ func registerV1Routes(engine *gin.Engine, brainProxy *proxy.BrainProxy, tokenMan
 	// 所有面向 Python Brain 的路由都经过 Auth -> Tenant -> Casbin。
 	// Go 网关只做身份、租户和 API 资源治理；Agent 业务执行仍全部留在 Python Brain。
 	v1.Use(protectedMiddleware(tokenManager, userStore, enforcer, authEnabled)...)
+	v1.GET("/workspace", brainProxy.ServeWithPath("/api/workspace"))
+	v1.GET("/dashboard", brainProxy.ServeWithPath("/api/dashboard"))
+	v1.GET("/products", brainProxy.ServeWithPath("/api/products"))
+	v1.POST("/products/analyze", brainProxy.ServeWithPath("/api/products/analyze"))
+	v1.GET("/inventory/risks", brainProxy.ServeWithPath("/api/inventory/risks"))
+	v1.POST("/inventory/replenishment-plan", brainProxy.ServeWithPath("/api/inventory/replenishment-plan"))
+	v1.GET("/campaigns", brainProxy.ServeWithPath("/api/campaigns"))
+	v1.POST("/campaigns/:campaign_id/review", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/campaigns/" + c.Param("campaign_id") + "/review"
+		brainProxy.Serve(c)
+	})
+	v1.POST("/onboarding/complete", brainProxy.ServeWithPath("/api/onboarding/complete"))
+	v1.POST("/ai-chat/messages", brainProxy.ServeWithPath("/api/ai-chat/messages"))
+	v1.Any("/reports", brainProxy.ServeWithPath("/api/reports"))
+	v1.Any("/reports/*path", brainProxy.ServeWithPrefixReplace("/api/v1/reports", "/api/reports"))
+	v1.Any("/agents", brainProxy.ServeWithPath("/api/agents"))
+	v1.Any("/agents/*path", brainProxy.ServeWithPrefixReplace("/api/v1/agents", "/api/agents"))
+	v1.Any("/data-import/*path", brainProxy.ServeWithPrefixReplace("/api/v1/data-import", "/api/data-import"))
+	v1.Any("/shops", brainProxy.ServeWithPath("/api/shops"))
+	v1.Any("/shops/*path", brainProxy.ServeWithPrefixReplace("/api/v1/shops", "/api/shops"))
+	v1.Any("/integrations", brainProxy.ServeWithPath("/api/integrations"))
+	v1.Any("/integrations/*path", brainProxy.ServeWithPrefixReplace("/api/v1/integrations", "/api/integrations"))
 	v1.POST("/tasks", brainProxy.ServeWithPath("/api/task"))
 	v1.GET("/tasks", brainProxy.ServeWithPath("/api/tasks"))
 	v1.GET("/tasks/:thread_id", func(c *gin.Context) {

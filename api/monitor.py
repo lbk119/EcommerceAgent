@@ -39,7 +39,7 @@ class ToolMonitor:
         """设置 FastAPI 的 WebSocket 管理器"""
         self.websocket_manager = manager
 
-    def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
+    def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None, thread_id: Optional[str] = None):
         """内部发送方法"""
         payload = {
             "type": "monitor_event",
@@ -53,13 +53,13 @@ class ToolMonitor:
         if self.websocket_manager:
             try:
                 # 获取当前线程 ID
-                thread_id = get_thread_context()
+                target_thread_id = thread_id or get_thread_context()
 
                 # 确保 loop 已加载 [fastapi的事件循环]
                 manager_loop = self.websocket_manager.loop
 
                 if manager_loop:
-                    if thread_id:
+                    if target_thread_id:
                         # 检查当前是否在同一个事件循环中
                         try:
                             # 当前的循环事件
@@ -71,7 +71,7 @@ class ToolMonitor:
                         if current_loop and current_loop == manager_loop:
                             # 如果在同一个循环中（例如在 create_task 中运行），直接创建任务
                             current_loop.create_task(
-                                self.websocket_manager.send_to_thread(payload, thread_id)
+                                self.websocket_manager.send_to_thread(payload, target_thread_id)
                             )
                         else:
                             #  FastAPI 的 WebSocket 依赖异步事件循环，且协程必须在创建它的循环中运行：
@@ -79,7 +79,7 @@ class ToolMonitor:
                             #  如果在不同循环 / 不同线程（比如同步线程调用）：必须用 asyncio.run_coroutine_threadsafe（线程安全的方式），否则会报错 “协程在错误的循环中运行”。
                             # 如果在不同线程，使用 threadsafe 方法
                             asyncio.run_coroutine_threadsafe(
-                                self.websocket_manager.send_to_thread(payload, thread_id),
+                                self.websocket_manager.send_to_thread(payload, target_thread_id),
                                 manager_loop
                             )
                     else:

@@ -5,9 +5,27 @@ from pathlib import Path
 from dotenv import load_dotenv
 from mysql.connector import Error, connect
 
+from api.context import get_identity_context
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
+
+TENANT_SCOPED_TABLES = {
+    "customers",
+    "sellers",
+    "products",
+    "orders",
+    "order_items",
+    "payments",
+    "reviews",
+    "inventory",
+    "traffic_stats",
+    "campaigns",
+    "campaign_product_stats",
+    "refunds",
+    "customer_service_tickets",
+}
 
 
 def get_db_config() -> dict:
@@ -64,11 +82,16 @@ def get_table_schema_raw(table_name: str) -> str:
 
 def get_table_data_raw(table_name: str, limit: int = 20) -> str:
     """Return limited table data as CSV-style text."""
+    if table_name in TENANT_SCOPED_TABLES:
+        scope = current_data_scope_sql(table_name)
+        if not scope:
+            return "查询被拒绝：缺少可信 tenant/shop 上下文，不能读取店铺经营数据。"
     limit = max(1, min(int(limit), 100))
     try:
         with connect(**get_db_config()) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(f"select * from {table_name} limit {limit}")
+                where_clause = f" WHERE {scope}" if table_name in TENANT_SCOPED_TABLES else ""
+                cursor.execute(f"select * from {table_name}{where_clause} limit {limit}")
                 description = cursor.description
                 if not description:
                     return f"数据表：{table_name}为空没有数据！"
@@ -89,6 +112,10 @@ def execute_read_sql_raw(query: str) -> str:
     if re.match(r"^select\b", stripped_query, re.IGNORECASE) and not re.search(r"\blimit\b", stripped_query, re.IGNORECASE):
         stripped_query = f"{stripped_query} LIMIT 100"
 
+    isolation_error = validate_tenant_scoped_read_sql(stripped_query)
+    if isolation_error:
+        return isolation_error
+
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
@@ -102,6 +129,37 @@ def execute_read_sql_raw(query: str) -> str:
                 return f"{','.join(columns)}\n{chr(10).join(results)}"
     except Error as error:
         return f"查询出现异常：{str(error)}"
+
+
+def current_data_scope_sql(alias: str | None = None) -> str:
+    """生成当前请求的 tenant/shop SQL 条件；没有可信上下文时返回空字符串。"""
+    identity = get_identity_context()
+    if not identity or not identity.tenant_id or not identity.shop_id:
+        return ""
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}tenant_id = '{_escape_sql_literal(identity.tenant_id)}' AND {prefix}shop_id = '{_escape_sql_literal(identity.shop_id)}'"
+
+
+def validate_tenant_scoped_read_sql(query: str) -> str:
+    """
+    自由 SQL 的租户隔离兜底。
+
+    固定 workflow 会显式拼接 current_data_scope_sql；通用 execute_sql_query 允许 LLM 写 SQL，但只要碰到
+    经营表，就必须显式包含 tenant_id 和 shop_id，防止跨店铺扫数。这里是治理兜底，不做 SQL 重写。
+    """
+    lowered = query.lower()
+    touched_tables = [table for table in TENANT_SCOPED_TABLES if re.search(rf"\b{re.escape(table)}\b", lowered)]
+    if not touched_tables:
+        return ""
+    if not current_data_scope_sql():
+        return "查询被拒绝：缺少可信 tenant/shop 上下文，不能读取店铺经营数据。"
+    if "tenant_id" not in lowered or "shop_id" not in lowered:
+        return "查询被拒绝：访问经营数据表必须显式包含 tenant_id 和 shop_id 过滤条件。"
+    return ""
+
+
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
 
 
 def execute_write_sql_raw(query: str, target_database: str | None = None) -> dict:
