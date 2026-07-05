@@ -1,0 +1,45 @@
+# --- Deep Agents Framework ---
+deepagents>=0.1.0
+
+# --- LangChain Ecosystem ---
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langgraph>=0.1.0
+
+# --- LLM Services ---
+langchain-openai>=0.1.0
+openai>=1.0.0
+
+# --- Web Services ---
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+python-multipart>=0.0.6
+
+# --- Database ---
+mysql-connector-python>=8.0.0
+
+# --- File Processing ---
+python-docx>=1.0.0
+pypdf>=3.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+aiofiles>=23.0.0
+
+# --- External Integrations ---
+tavily-python>=0.3.0
+ragflow-sdk>=0.1.0
+requests>=2.31.0
+torch>=2.6,<2.8
+pymilvus>=2.4.0
+FlagEmbedding>=1.2.11
+
+# --- Optional Queue Backends ---
+redis>=5.0.0
+nats-py>=2.7.0
+
+# --- Utilities ---
+PyYAML>=6.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+typing-extensions>=4.5.0

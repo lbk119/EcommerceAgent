@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.kaggle/
+kaggle.json
+
+# Runtime outputs
+.run-logs/
+output/
+updated/
+data/memory/
+
+# Downloaded datasets and generated demo data
+data/olist/*.zip
+data/olist/*.csv
+
+# Frontend
+ui/node_modules/
+ui/dist/
+
+# Go build outputs
+*.exe
+*.test
