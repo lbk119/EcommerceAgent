@@ -2,8 +2,11 @@ package auth
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -41,6 +44,12 @@ type UserStore interface {
 	UpdateProfile(userID string, input ProfileInput) (User, error)
 	UpdatePassword(userID string, currentPassword string, newPassword string) error
 	SetOnboardingCompleted(userID string, completed bool) (User, error)
+	Backend() StoreBackendInfo
+}
+
+type StoreBackendInfo struct {
+	Backend       string
+	MySQLDatabase string
 }
 
 type RegisterInput struct {
@@ -65,15 +74,29 @@ type ProfileInput struct {
 }
 
 type StaticUserStore struct {
-	mu    sync.RWMutex
-	users map[string]User
+	mu       sync.RWMutex
+	users    map[string]User
+	filePath string
 }
 
-func NewUserStoreFromConfig(backend string) (UserStore, error) {
-	if backend == "" || strings.EqualFold(backend, "static") {
+func NewUserStoreFromConfig(backend string, mode string) (UserStore, error) {
+	selectedBackend := strings.ToLower(strings.TrimSpace(backend))
+	if selectedBackend == "" {
+		selectedBackend = "mysql"
+	}
+	if selectedBackend == "mysql" {
+		return newMySQLUserStoreFromEnv()
+	}
+	if selectedBackend == "memory" {
+		if !strings.EqualFold(mode, "debug") && !strings.EqualFold(mode, "test") && os.Getenv("GO_WANT_HELPER_PROCESS") == "" {
+			return nil, fmt.Errorf("%s user store is dev/test only; set GATEWAY_USER_STORE_BACKEND=mysql for commercial mode", selectedBackend)
+		}
 		return NewStaticUserStore(), nil
 	}
-	return newMySQLUserStoreFromEnv()
+	if selectedBackend == "static" {
+		return nil, fmt.Errorf("static/json user store is no longer a supported runtime backend; use mysql, or memory in debug/test only")
+	}
+	return nil, fmt.Errorf("unsupported user store backend: %s", backend)
 }
 
 func NewStaticUserStore() *StaticUserStore {
@@ -88,11 +111,11 @@ func NewStaticUserStore() *StaticUserStore {
 
 	user := User{
 		ID:              userID,
-		Name:            envOrDefault("GATEWAY_DEMO_USER_NAME", "本地管理员"),
+		Name:            envOrDefault("GATEWAY_DEMO_USER_NAME", "Demo Admin"),
 		Email:           envOrDefault("GATEWAY_DEMO_USER_EMAIL", "operator@example.com"),
-		CompanyName:     envOrDefault("GATEWAY_DEMO_COMPANY_NAME", "EcomPilot 示例公司"),
-		Plan:            envOrDefault("GATEWAY_DEMO_PLAN", "团队版"),
-		CreatedAt:       "本地开发",
+		CompanyName:     envOrDefault("GATEWAY_DEMO_COMPANY_NAME", "EcomPilot Demo Company"),
+		Plan:            envOrDefault("GATEWAY_DEMO_PLAN", "Team"),
+		CreatedAt:       "local_dev",
 		OnboardingDone:  true,
 		Password:        password,
 		TenantIDs:       splitCSV(envOrDefault("GATEWAY_DEMO_TENANT_IDS", defaultTenant)),
@@ -103,7 +126,18 @@ func NewStaticUserStore() *StaticUserStore {
 		Permissions:     permissions,
 	}
 
-	return &StaticUserStore{users: map[string]User{userID: user}}
+	// memory/static is dev/test only. JSON is used only when GATEWAY_STATIC_USER_FILE is explicit.
+	store := &StaticUserStore{users: map[string]User{userID: user}, filePath: os.Getenv("GATEWAY_STATIC_USER_FILE")}
+	store.loadFromFile()
+	if _, ok := store.users[userID]; !ok {
+		store.users[userID] = user
+		store.persistLocked()
+	}
+	return store
+}
+
+func (s *StaticUserStore) Backend() StoreBackendInfo {
+	return StoreBackendInfo{Backend: "memory"}
 }
 
 func (s *StaticUserStore) Authenticate(username string, password string) (User, error) {
@@ -136,7 +170,7 @@ func (s *StaticUserStore) FindByID(userID string) (User, bool) {
 }
 
 func (s *StaticUserStore) Register(input RegisterInput) (User, error) {
-	userID := normalizeIdentifier(firstNonEmpty(input.UserID, input.Email))
+	userID := normalizeIdentifier(firstNonEmpty(input.UserID, input.Email, input.Phone))
 	if userID == "" {
 		return User{}, errors.New("user id required")
 	}
@@ -166,8 +200,8 @@ func (s *StaticUserStore) Register(input RegisterInput) (User, error) {
 		Email:           firstNonEmpty(input.Email, input.UserID),
 		Phone:           input.Phone,
 		CompanyName:     firstNonEmpty(input.CompanyName, input.TenantName, tenantID),
-		Plan:            firstNonEmpty(input.Plan, "团队版"),
-		CreatedAt:       "刚刚",
+		Plan:            firstNonEmpty(input.Plan, "Team"),
+		CreatedAt:       "now",
 		OnboardingDone:  shopID != "",
 		Password:        input.Password,
 		TenantIDs:       []string{tenantID},
@@ -182,6 +216,7 @@ func (s *StaticUserStore) Register(input RegisterInput) (User, error) {
 		user.DefaultShopID = shopID
 	}
 	s.users[userID] = user
+	s.persistLocked()
 	return user, nil
 }
 
@@ -207,6 +242,7 @@ func (s *StaticUserStore) AddShop(userID string, tenantID string, shopID string)
 	}
 	user.OnboardingDone = true
 	s.users[userID] = user
+	s.persistLocked()
 	return user, nil
 }
 
@@ -222,6 +258,7 @@ func (s *StaticUserStore) UpdateProfile(userID string, input ProfileInput) (User
 	user.Phone = firstNonEmpty(input.Phone, user.Phone)
 	user.CompanyName = firstNonEmpty(input.CompanyName, user.CompanyName)
 	s.users[userID] = user
+	s.persistLocked()
 	return user, nil
 }
 
@@ -240,6 +277,7 @@ func (s *StaticUserStore) UpdatePassword(userID string, currentPassword string, 
 	}
 	user.Password = newPassword
 	s.users[userID] = user
+	s.persistLocked()
 	return nil
 }
 
@@ -252,7 +290,41 @@ func (s *StaticUserStore) SetOnboardingCompleted(userID string, completed bool) 
 	}
 	user.OnboardingDone = completed
 	s.users[userID] = user
+	s.persistLocked()
 	return user, nil
+}
+
+func (s *StaticUserStore) loadFromFile() {
+	if s.filePath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.filePath)
+	if err != nil {
+		return
+	}
+	var users map[string]User
+	if json.Unmarshal(data, &users) != nil {
+		return
+	}
+	for id, user := range users {
+		if strings.TrimSpace(id) != "" {
+			s.users[id] = user
+		}
+	}
+}
+
+func (s *StaticUserStore) persistLocked() {
+	if s.filePath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(s.filePath), 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(s.users, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(s.filePath, data, 0o600)
 }
 
 func splitCSV(value string) []string {
@@ -279,7 +351,7 @@ func normalizeIdentifier(value string) string {
 	if trimmed == "" {
 		return ""
 	}
-	replacer := regexp.MustCompile(`[^\p{L}\p{N}_\-]+`)
+	replacer := regexp.MustCompile(`[^a-z0-9_\-]+`)
 	normalized := replacer.ReplaceAllString(trimmed, "_")
 	return strings.Trim(normalized, "_-")
 }

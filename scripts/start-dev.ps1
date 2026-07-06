@@ -66,6 +66,45 @@ function ConvertToSingleQuotedValue($Value) {
     return $Value.Replace("'", "''")
 }
 
+function GetProcessEnv($Name) {
+    return [Environment]::GetEnvironmentVariable($Name, "Process")
+}
+
+function SetProcessEnvIfEmpty($Name, $Value) {
+    if ([string]::IsNullOrEmpty((GetProcessEnv $Name))) {
+        [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+    }
+}
+
+function ImportDotEnv($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    WriteStep "Loading .env"
+    foreach ($rawLine in Get-Content -LiteralPath $Path) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) {
+            continue
+        }
+        if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') {
+            continue
+        }
+
+        $name = $Matches[1]
+        $value = $Matches[2].Trim()
+        if ($value.Length -ge 2) {
+            $first = $value.Substring(0, 1)
+            $last = $value.Substring($value.Length - 1, 1)
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        SetProcessEnvIfEmpty $name $value
+    }
+}
+
 function StartDevWindow($Name, $Command) {
     $safeRoot = ConvertToSingleQuotedValue $ProjectRoot
     $safeLog = ConvertToSingleQuotedValue (Join-Path $LogDir "$Name.log")
@@ -88,6 +127,48 @@ Set-Location $ProjectRoot
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 WriteStep "Project root: $ProjectRoot"
+ImportDotEnv (Join-Path $ProjectRoot ".env")
+SetProcessEnvIfEmpty "MYSQL_HOST" "localhost"
+SetProcessEnvIfEmpty "MYSQL_PORT" "3306"
+SetProcessEnvIfEmpty "MYSQL_USER" "root"
+SetProcessEnvIfEmpty "MYSQL_DATABASE" "ecommerce_demo"
+SetProcessEnvIfEmpty "GATEWAY_USER_STORE_BACKEND" "mysql"
+SetProcessEnvIfEmpty "MAX_AGENT_CONCURRENCY" "10"
+SetProcessEnvIfEmpty "REALTIME_AGENT_CONCURRENCY" "8"
+SetProcessEnvIfEmpty "STANDARD_AGENT_CONCURRENCY" "2"
+SetProcessEnvIfEmpty "DEEP_AGENT_CONCURRENCY" "1"
+SetProcessEnvIfEmpty "AI_CHAT_MODEL_PROFILE" "fast"
+SetProcessEnvIfEmpty "AI_CHAT_LLM_TIMEOUT_SECONDS" "8"
+SetProcessEnvIfEmpty "AI_CHAT_LLM_MAX_RETRIES" "1"
+SetProcessEnvIfEmpty "AI_CHAT_TOTAL_TARGET_SECONDS" "15"
+SetProcessEnvIfEmpty "AI_CHAT_DEEPAGENT_ENABLED" "false"
+SetProcessEnvIfEmpty "REALTIME_PLAN_STEP_TIMEOUT_SECONDS" "2"
+SetProcessEnvIfEmpty "REALTIME_PLAN_GLOBAL_TIMEOUT_SECONDS" "8"
+SetProcessEnvIfEmpty "REALTIME_PLAN_POLISH_TIMEOUT_SECONDS" "3"
+SetProcessEnvIfEmpty "REALTIME_PLAN_FAST_POLISH" "false"
+SetProcessEnvIfEmpty "STANDARD_PLAN_STEP_TIMEOUT_SECONDS" "2"
+SetProcessEnvIfEmpty "STANDARD_PLAN_GLOBAL_TIMEOUT_SECONDS" "30"
+SetProcessEnvIfEmpty "STANDARD_PLAN_POLISH_TIMEOUT_SECONDS" "6"
+SetProcessEnvIfEmpty "STANDARD_PLAN_FAST_POLISH" "false"
+SetProcessEnvIfEmpty "DEEP_PLAN_STEP_TIMEOUT_SECONDS" "3"
+SetProcessEnvIfEmpty "DEEP_PLAN_GLOBAL_TIMEOUT_SECONDS" "60"
+SetProcessEnvIfEmpty "DEEP_PLAN_POLISH_TIMEOUT_SECONDS" "8"
+SetProcessEnvIfEmpty "DEEP_PLAN_FAST_POLISH" "true"
+SetProcessEnvIfEmpty "LLM_FAST_TIMEOUT_SECONDS" "8"
+SetProcessEnvIfEmpty "LLM_FAST_MAX_RETRIES" "1"
+SetProcessEnvIfEmpty "LLM_DEEP_TIMEOUT_SECONDS" "60"
+SetProcessEnvIfEmpty "LLM_DEEP_MAX_RETRIES" "1"
+SetProcessEnvIfEmpty "STANDARD_AGENT_ALLOW_DEEPAGENT_FALLBACK" "false"
+SetProcessEnvIfEmpty "DEEP_AGENT_ENABLE_NETWORK_SEARCH" "false"
+SetProcessEnvIfEmpty "DEEP_AGENT_ENABLE_KNOWLEDGE_BASE" "false"
+SetProcessEnvIfEmpty "AGENT_HOT_PATH_MEMORY_WRITE" "false"
+
+if ((GetProcessEnv "GATEWAY_USER_STORE_BACKEND") -eq "mysql" -and [string]::IsNullOrEmpty((GetProcessEnv "MYSQL_PASSWORD"))) {
+    $missingPasswordMessage = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("TVlTUUxfUEFTU1dPUkQg5pyq6K6+572u77yM6K+35ZyoIC5lbnYg5oiW5b2T5YmNIFBvd2VyU2hlbGwg546v5aKD5Lit6YWN572uIE15U1FMIOWvhueggQ=="))
+    Write-Host $missingPasswordMessage -ForegroundColor Red
+    exit 1
+}
+
 TestRequiredCommand "go" "Install Go and make sure it is available in PATH."
 TestRequiredCommand "node" "Install Node.js 20+ and make sure it is available in PATH."
 TestRequiredCommand "npm" "Install npm with Node.js."

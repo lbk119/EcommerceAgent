@@ -23,6 +23,7 @@ from agent.core.tool_registry import tool_registry
 from agent.loop_guard import AgentLoopGuard, evaluate_loop_with_supervisor
 from agent.memory.evolution_memory import append_task_event
 from agent.observability.tracer import tracer
+from agent.runtime.budget import AgentExecutionBudget, BudgetExceededError
 
 
 # tool_call_started 和 tool_call_finished 来自 DeepAgents 流里的不同节点：
@@ -67,10 +68,11 @@ async def run_agent_with_reflection(agent, task_query: str, path_instruction: st
     result_pipeline 统一记录失败、生成反思和策略建议。
     """
     reflection_prompt = ""
-    max_reflection_retries = int(os.getenv("AGENT_LOOP_REFLECTION_RETRIES", "1"))
+    budget = _budget_from_config(config)
+    max_reflection_retries = budget.max_reflection_retries if budget else int(os.getenv("AGENT_LOOP_REFLECTION_RETRIES", "1"))
     for attempt in range(max_reflection_retries + 1):
         try:
-            return await _run_agent_stream(agent, task_query + path_instruction + reflection_prompt, config, task_id)
+            return await _run_agent_stream(agent, task_query + path_instruction + reflection_prompt, config, task_id, budget=budget)
         except LoopDetectedError as loop_error:
             if loop_error.decision == "abort" or attempt >= max_reflection_retries:
                 raise
@@ -124,7 +126,7 @@ async def _resolve_loop_detection(task_id: str, summary: str, suggested_decision
     raise LoopDetectedError(summary, "abort")
 
 
-async def _run_agent_stream(agent, user_content: str, config: dict, task_id: str) -> str:
+async def _run_agent_stream(agent, user_content: str, config: dict, task_id: str, *, budget: AgentExecutionBudget | None = None) -> str:
     """消费 DeepAgents astream 输出，提取最终结果并上报工具/子 Agent 事件。"""
     final_result = ""
     last_non_empty_content = ""
@@ -132,22 +134,32 @@ async def _run_agent_stream(agent, user_content: str, config: dict, task_id: str
     recursion_limit = config.get("recursion_limit")
     monitor._emit("agent_stream_started", "DeepAgent 流式执行已开始，正在等待模型首个响应", {"task_id": task_id})
 
-    async for chunk in agent.astream({"messages": [{"role": "user", "content": user_content}]}, config=config):
-        for node_name, state in chunk.items():
-            if not state or "messages" not in state:
-                continue
-            messages = state["messages"]
-            if not messages or not isinstance(messages, list):
-                continue
+    try:
+        async for chunk in agent.astream({"messages": [{"role": "user", "content": user_content}]}, config=config):
+            if budget:
+                budget.check_wall_time()
+            for node_name, state in chunk.items():
+                if not state or "messages" not in state:
+                    continue
+                messages = state["messages"]
+                if not messages or not isinstance(messages, list):
+                    continue
 
-            last_msg = messages[-1]
-            if getattr(last_msg, "content", None):
-                last_non_empty_content = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
+                last_msg = messages[-1]
+                if getattr(last_msg, "content", None):
+                    last_non_empty_content = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
 
-            if node_name == "model":
-                final_result = await _handle_model_message(last_msg, loop_guard, recursion_limit, task_id, final_result)
-            elif node_name == "tools":
-                _trace_tool_call_finished(last_msg, node_name)
+                if node_name == "model":
+                    final_result = await _handle_model_message(last_msg, loop_guard, recursion_limit, task_id, final_result, budget=budget)
+                elif node_name == "tools":
+                    _trace_tool_call_finished(last_msg, node_name)
+    except BudgetExceededError as error:
+        tracer.emit("budget_exceeded", trace_id=task_id, task_id=task_id, conversation_id=config.get("configurable", {}).get("thread_id"), agent_name="agent_budget", error=error.reason, metadata=error.snapshot)
+        monitor._emit("budget_exceeded", error.reason, {"task_id": task_id, **error.snapshot})
+        partial = final_result or last_non_empty_content
+        if partial:
+            return f"{partial}\n\n> 已达到当前 Agent 执行预算，以上为阶段性结果。"
+        return f"当前任务已达到执行预算：{error.reason}。请缩小问题范围，或转为 deep 后台任务继续执行。"
 
     if not final_result and last_non_empty_content:
         final_result = last_non_empty_content
@@ -155,11 +167,13 @@ async def _run_agent_stream(agent, user_content: str, config: dict, task_id: str
     return final_result
 
 
-async def _handle_model_message(last_msg, loop_guard: AgentLoopGuard, recursion_limit: int, task_id: str, final_result: str) -> str:
+async def _handle_model_message(last_msg, loop_guard: AgentLoopGuard, recursion_limit: int, task_id: str, final_result: str, *, budget: AgentExecutionBudget | None = None) -> str:
     """处理 model 节点输出：要么是工具调用，要么是最终回答。"""
+    if budget:
+        budget.record_model_call()
     if getattr(last_msg, "tool_calls", None):
         for tool_call in last_msg.tool_calls:
-            await _guard_tool_call(loop_guard, tool_call, recursion_limit, task_id)
+            await _guard_tool_call(loop_guard, tool_call, recursion_limit, task_id, budget=budget)
             if tool_call["name"] == "task":
                 monitor.report_assistant(tool_call["args"]["subagent_type"], {"description": tool_call["args"]["description"]})
             _trace_tool_call_started(tool_call, "model")
@@ -172,13 +186,20 @@ async def _handle_model_message(last_msg, loop_guard: AgentLoopGuard, recursion_
     return final_result
 
 
-async def _guard_tool_call(loop_guard: AgentLoopGuard, tool_call: dict, recursion_limit: int, task_id: str) -> None:
+async def _guard_tool_call(loop_guard: AgentLoopGuard, tool_call: dict, recursion_limit: int, task_id: str, *, budget: AgentExecutionBudget | None = None) -> None:
     """对每次工具/子 Agent 调用做循环检测和监督模型兜底判断。"""
+    if budget:
+        tool_name = str(tool_call.get("name") or "unknown")
+        budget.record_tool_call(tool_name)
+        if tool_name == "task":
+            args = tool_call.get("args") or {}
+            budget.record_subagent_call(str(args.get("subagent_type") or "unknown"))
     loop_summary = loop_guard.record_tool_call(tool_call)
     if loop_summary:
         await _resolve_loop_detection(task_id, loop_summary, "reflect")
 
-    if loop_guard.should_supervise(recursion_limit):
+    supervisor_enabled = os.getenv("AGENT_SUPERVISOR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    if supervisor_enabled and loop_guard.should_supervise(recursion_limit):
         supervisor_summary = loop_guard.summary("轻量监督器按调用步数触发检查")
         decision, reason = await evaluate_loop_with_supervisor(supervisor_summary)
         monitor._emit("loop_supervisor", f"监督器判断: {decision} - {reason}", {
@@ -256,3 +277,8 @@ def _trace_tool_call_finished(message, node_name: str) -> None:
 def _tool_call_id(tool_call: dict, tool_name: str, started_at: float) -> str:
     """从 LangChain tool_call dict 中提取稳定 id；缺失时生成可读 fallback。"""
     return str(tool_call.get("id") or tool_call.get("tool_call_id") or f"{tool_name}:{started_at}")
+
+
+def _budget_from_config(config: dict) -> AgentExecutionBudget | None:
+    budget = (config.get("configurable") or {}).get("execution_budget")
+    return budget if isinstance(budget, AgentExecutionBudget) else None

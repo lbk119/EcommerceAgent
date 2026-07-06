@@ -80,6 +80,16 @@ def set_identity_context(identity: MemoryIdentity):
     return _identity_ctx.set(identity)
 
 
+def reset_thread_context(thread_token):
+    """按 set_thread_context 返回的 token 恢复 thread 上下文，供轻量运行时避免串台。"""
+    _thread_id_ctx.reset(thread_token)
+
+
+def reset_identity_context(identity_token):
+    """按 set_identity_context 返回的 token 恢复身份上下文，供后台协程安全清理。"""
+    _identity_ctx.reset(identity_token)
+
+
 def get_identity_context() -> Optional[MemoryIdentity]:
     """获取当前请求链路的身份上下文。"""
     return _identity_ctx.get()

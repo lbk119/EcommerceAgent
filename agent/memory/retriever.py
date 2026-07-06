@@ -4,7 +4,7 @@ from agent.memory.schema import MemoryIdentity
 from agent.memory.store import get_memory_store
 
 try:
-    from agent.memory.milvus_store import search_memory_embeddings
+    from agent_extensions.semantic_memory.milvus_store import search_memory_embeddings
 except Exception:
     search_memory_embeddings = None
 

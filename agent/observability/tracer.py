@@ -129,22 +129,48 @@ class JsonlTracer:
 
 
 _LIVE_PROGRESS_EVENTS = {
+    "queued",
+    "prompt_guard_started",
+    "prompt_guard_finished",
+    "task_classified",
+    "context_prepared",
+    "memory_retrieval_started",
+    "memory_retrieval_finished",
     "memory_retrieved",
     "agent_started",
     "runtime_stage_completed",
+    "plan_execution_started",
+    "plan_execution_finished",
+    "plan_step_started",
+    "plan_step_finished",
+    "plan_step_failed",
     "workflow_route_decided",
     "workflow_step_started",
     "workflow_step_finished",
     "workflow_step_failed",
     "workflow_finished",
     "workflow_failed",
+    "tool_call_started",
+    "tool_call_finished",
+    "tool_call_failed",
     "llm_call_started",
     "llm_call_finished",
     "llm_call_failed",
+    "reducer_started",
+    "reducer_finished",
+    "reducer_polish_started",
+    "reducer_polish_finished",
+    "reducer_polish_failed",
     "critic_policy_evaluated",
     "critic_started",
     "critic_finished",
+    "critic_skipped",
     "critic_failed",
+    "persistence_started",
+    "persistence_finished",
+    "memory_write_started",
+    "memory_write_finished",
+    "memory_write_skipped",
     "memory_written",
     "agent_finished",
 }
@@ -153,6 +179,21 @@ _LIVE_PROGRESS_EVENTS = {
 def _live_progress_message(event: TraceEvent) -> str:
     metadata = event.metadata or {}
     event_type = event.event_type
+    if event_type == "queued":
+        return "Agent 已接收任务，正在进入运行队列"
+    if event_type == "prompt_guard_started":
+        return "正在进行提示词安全检查"
+    if event_type == "prompt_guard_finished":
+        return "提示词安全检查完成"
+    if event_type == "task_classified":
+        task_type = (metadata.get("task_classification") or {}).get("task_type", metadata.get("intent", "unknown"))
+        return f"已识别问题类型：{task_type}"
+    if event_type == "context_prepared":
+        return "运行上下文已准备完成"
+    if event_type == "memory_retrieval_started":
+        return "正在检索长期记忆"
+    if event_type == "memory_retrieval_finished":
+        return f"长期记忆检索完成：{metadata.get('count', 0)} 条"
     if event_type == "memory_retrieved":
         return f"长期记忆召回完成：{metadata.get('count', 0)} 条"
     if event_type == "agent_started":
@@ -160,6 +201,16 @@ def _live_progress_message(event: TraceEvent) -> str:
         return f"Agent 已启动，任务类型：{task_type}"
     if event_type == "runtime_stage_completed":
         return f"运行阶段完成：{metadata.get('stage', 'unknown')}"
+    if event_type == "plan_execution_started":
+        return f"计划已生成，准备并行执行 {metadata.get('step_count', 0)} 个节点"
+    if event_type == "plan_execution_finished":
+        return "并行计划执行完成" if not metadata.get("critical_failed") else "并行计划执行完成，但关键节点失败"
+    if event_type == "plan_step_started":
+        return f"并行读取：{metadata.get('step_name')}"
+    if event_type == "plan_step_finished":
+        return f"并行节点完成：{metadata.get('step_name')}，返回 {metadata.get('row_count', 0)} 行"
+    if event_type == "plan_step_failed":
+        return f"并行节点失败：{metadata.get('step_name')}"
     if event_type == "workflow_route_decided":
         if metadata.get("selected"):
             return f"已选择 workflow：{metadata.get('workflow_name')}"
@@ -174,6 +225,12 @@ def _live_progress_message(event: TraceEvent) -> str:
         return f"workflow 完成：{metadata.get('workflow_name')}"
     if event_type == "workflow_failed":
         return f"workflow 失败：{metadata.get('workflow_name')}，回落 DeepAgent"
+    if event_type == "tool_call_started":
+        return f"开始调用工具：{metadata.get('tool_name', 'unknown')}"
+    if event_type == "tool_call_finished":
+        return f"工具调用完成：{metadata.get('tool_name', 'unknown')}"
+    if event_type == "tool_call_failed":
+        return f"工具调用失败：{metadata.get('tool_name', 'unknown')}"
     if event_type == "llm_call_started":
         return f"开始调用模型：{metadata.get('profile') or event.agent_name}"
     if event_type == "llm_call_finished":
@@ -181,14 +238,36 @@ def _live_progress_message(event: TraceEvent) -> str:
         return f"模型调用完成：{metadata.get('profile') or event.agent_name}，耗时 {seconds}s"
     if event_type == "llm_call_failed":
         return f"模型调用失败：{metadata.get('profile') or event.agent_name}"
+    if event_type == "reducer_started":
+        return "正在汇总并行结果"
+    if event_type == "reducer_finished":
+        return "并行结果汇总完成"
+    if event_type == "reducer_polish_started":
+        return "fast model 正在润色答案"
+    if event_type == "reducer_polish_finished":
+        return "fast model 润色完成"
+    if event_type == "reducer_polish_failed":
+        return "fast model 润色失败，返回确定性结论"
     if event_type == "critic_policy_evaluated":
         return "Critic 策略已评估" if metadata.get("required") else "Critic 策略已评估：本次跳过"
     if event_type == "critic_started":
         return "Critic 开始校验"
     if event_type == "critic_finished":
         return "Critic 校验完成"
+    if event_type == "critic_skipped":
+        return "轻量检查已跳过 Critic"
     if event_type == "critic_failed":
         return "Critic 校验失败"
+    if event_type == "persistence_started":
+        return "正在持久化分析结果"
+    if event_type == "persistence_finished":
+        return "分析结果已持久化"
+    if event_type == "memory_write_started":
+        return "正在沉淀长期记忆"
+    if event_type == "memory_write_finished":
+        return f"长期记忆沉淀完成：{metadata.get('written', 0)} 条"
+    if event_type == "memory_write_skipped":
+        return "轻量对话已延后长期记忆写入"
     if event_type == "memory_written":
         return f"长期记忆写入完成：{metadata.get('written', 0)} 条"
     if event_type == "agent_finished":

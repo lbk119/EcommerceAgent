@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import re
 
 from agent.core.db import current_data_scope_sql, execute_read_sql_raw
+from api.context import get_identity_context
 
 
 @dataclass(frozen=True)
@@ -181,9 +182,34 @@ SELECT CONCAT('top_service_issue:', issue_type), CAST(ticket_count AS CHAR) FROM
 """)
 
 
+def query_shop_profile() -> str:
+    """查询当前店铺画像，作为季节性选品和经营策略类 workflow 的上下文节点。"""
+    identity = get_identity_context()
+    if not identity or not identity.tenant_id or not identity.shop_id:
+        raise RuntimeError("缺少可信 tenant/shop 上下文，无法执行店铺画像 workflow")
+    tenant_id = _sql_literal(identity.tenant_id)
+    shop_id = _sql_literal(identity.shop_id)
+    return execute_read_sql_raw(f"""
+SELECT
+    gs.id AS shop_id,
+    gs.name AS shop_name,
+    gs.category,
+    gs.platform,
+    gs.shop_type,
+    gs.business_stage,
+    gs.auth_status,
+    gs.data_status,
+    gs.last_sync_at
+FROM gateway_shops gs
+WHERE gs.tenant_id = {tenant_id} AND gs.id = {shop_id}
+LIMIT 1
+""")
+
+
 def query_inventory_risks(time_range: BusinessTimeRange | None = None) -> str:
     """查询库存预警的风险 SKU，固定覆盖低库存、缺货和滞销信号。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    order_bound_scope = _required_data_scope("orders")
     data_scope = _required_data_scope("o")
     item_scope = _required_data_scope("oi")
     inventory_scope = _required_data_scope("i")
@@ -191,7 +217,7 @@ def query_inventory_risks(time_range: BusinessTimeRange | None = None) -> str:
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     return execute_read_sql_raw(f"""
 WITH bounds AS (
-    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders
+    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders WHERE {order_bound_scope}
 ), recent_sales AS (
     SELECT
         oi.product_id,
@@ -241,6 +267,7 @@ LIMIT 20
 def query_inventory_velocity(time_range: BusinessTimeRange | None = None) -> str:
     """查询补货判断需要的销量速度、安全库存和建议补货量。"""
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    order_bound_scope = _required_data_scope("orders")
     data_scope = _required_data_scope("o")
     item_scope = _required_data_scope("oi")
     inventory_scope = _required_data_scope("i")
@@ -248,7 +275,7 @@ def query_inventory_velocity(time_range: BusinessTimeRange | None = None) -> str
     order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", time_range)
     return execute_read_sql_raw(f"""
 WITH bounds AS (
-    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders
+    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders WHERE {order_bound_scope}
 ), sales_30d AS (
     SELECT
         oi.product_id,
@@ -427,9 +454,9 @@ def query_hot_products(time_range: BusinessTimeRange | None = None, limit: int =
     limit = max(1, min(int(limit), 20))
 
     def run_query(active_time_range: BusinessTimeRange) -> str:
-        order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", active_time_range)
-        traffic_filter = _time_filter("ts.stat_date", "tb.max_time", active_time_range)
-        refund_filter = _time_filter("rf.refund_time", "rb.max_time", active_time_range)
+        order_bound_scope = _required_data_scope("orders")
+        traffic_bound_scope = _required_data_scope("traffic_stats")
+        refund_bound_scope = _required_data_scope("refunds")
         order_scope = _required_data_scope("o")
         item_scope = _required_data_scope("oi")
         traffic_scope = _required_data_scope("ts")
@@ -437,13 +464,16 @@ def query_hot_products(time_range: BusinessTimeRange | None = None, limit: int =
         campaign_scope = _required_data_scope("campaign_product_stats")
         product_scope = _required_data_scope("p")
         inventory_scope = _required_data_scope("i")
+        order_filter = _time_filter("o.order_purchase_timestamp", "b.max_time", active_time_range)
+        traffic_filter = _time_filter("ts.stat_date", "tb.max_time", active_time_range)
+        refund_filter = _time_filter("rf.refund_time", "rb.max_time", active_time_range)
         return execute_read_sql_raw(f"""
 WITH order_bounds AS (
-    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders
+    SELECT MAX(order_purchase_timestamp) AS max_time FROM orders WHERE {order_bound_scope}
 ), traffic_bounds AS (
-    SELECT MAX(stat_date) AS max_time FROM traffic_stats
+    SELECT MAX(stat_date) AS max_time FROM traffic_stats WHERE {traffic_bound_scope}
 ), refund_bounds AS (
-    SELECT MAX(refund_time) AS max_time FROM refunds
+    SELECT MAX(refund_time) AS max_time FROM refunds WHERE {refund_bound_scope}
 ), sales AS (
     SELECT
         oi.product_id,
@@ -561,6 +591,11 @@ def _required_data_scope(alias: str) -> str:
     if not scope:
         raise RuntimeError("缺少可信 tenant/shop 上下文，无法执行经营数据 workflow")
     return scope
+
+
+def _sql_literal(value: str) -> str:
+    """生成只用于可信身份上下文的 SQL 字符串字面量，避免 gateway_shops 特殊主键场景误用通用 shop_id scope。"""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _campaign_time_filter(time_range: BusinessTimeRange) -> str:

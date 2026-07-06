@@ -34,7 +34,7 @@ func Load() (Config, error) {
 		JWTSecret:        envOrDefault("GATEWAY_JWT_SECRET", "dev-only-change-me"),
 		JWTExpiresIn:     time.Duration(envIntOrDefault("GATEWAY_JWT_EXPIRES_SECONDS", 7200)) * time.Second,
 		AuthEnabled:      envBoolOrDefault("GATEWAY_AUTH_ENABLED", true),
-		UserStoreBackend: envOrDefault("GATEWAY_USER_STORE_BACKEND", "static"),
+		UserStoreBackend: envOrDefault("GATEWAY_USER_STORE_BACKEND", "mysql"),
 		CasbinModel:      envOrDefault("GATEWAY_CASBIN_MODEL", "gateway/configs/casbin/model.conf"),
 		CasbinPolicy:     envOrDefault("GATEWAY_CASBIN_POLICY", "gateway/configs/casbin/policy.csv"),
 	}, nil

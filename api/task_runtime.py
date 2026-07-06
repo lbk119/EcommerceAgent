@@ -77,14 +77,9 @@ class TaskRuntime:
             return task
 
     def _ensure_conversation_available(self, conversation_id: str | None, thread_id: str) -> None:
-        if not conversation_id:
-            return
-        active_task_id = self._conversation_latest_task.get(conversation_id)
-        if not active_task_id or active_task_id == thread_id:
-            return
-        active_state = self._states.get(active_task_id) or {}
-        if active_state.get("status") in {"queued", "running", "interrupted", "cancelling"}:
-            raise ValueError(f"当前会话已有任务运行中: conversation_id={conversation_id}, task_id={active_task_id}")
+        # AI Chat 需要允许用户在一个长任务运行时继续提问。任务隔离依赖唯一 task_id，WebSocket 仍按
+        # conversation_id 广播进度；前端用 messageId/taskId 归属事件，不再用“一个会话只能有一个任务”保护。
+        return
 
     @staticmethod
     def _close_coroutine(coroutine) -> None:
@@ -215,6 +210,19 @@ class TaskRuntime:
         async with self._lock:
             return [dict(state) for state in self._states.values()]
 
+    async def stats(self) -> dict:
+        """返回内存态任务运行统计，供 AgentRuntime 健康检查和前端状态面板使用。"""
+        async with self._lock:
+            statuses = [state.get("status") for state in self._states.values()]
+            return {
+                "total": len(statuses),
+                "queued": statuses.count("queued"),
+                "running": statuses.count("running"),
+                "failed": statuses.count("failed"),
+                "succeeded": statuses.count("succeeded"),
+                "cancelled": statuses.count("cancelled"),
+            }
+
     async def _finish(self, thread_id: str, task: asyncio.Task) -> None:
         async with self._lock:
             state = self._states.get(thread_id)
@@ -229,7 +237,11 @@ class TaskRuntime:
                     state["error"] = str(error)
                 else:
                     state["status"] = "succeeded"
-                    state["result"] = task.result()
+                    result = task.result()
+                    state["result"] = str(getattr(result, "content", result) or "")
+                    structured = getattr(result, "structured_result", None)
+                    if isinstance(structured, dict):
+                        state["structured_result"] = structured
             state["updated_at"] = time.time()
 
 

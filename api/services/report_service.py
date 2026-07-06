@@ -7,6 +7,7 @@ import uuid
 from api.db import execute, fetch_one
 from api.services.agent_job_service import create_agent_job
 from api.services.ecommerce_queries import list_reports
+from api.services.result_payload import parse_structured_json
 
 
 async def generate_report(tenant_id: str, shop_id: str, user_id: str, payload: dict) -> dict:
@@ -28,10 +29,10 @@ async def generate_report(tenant_id: str, shop_id: str, user_id: str, payload: d
 
 
 def get_report(tenant_id: str, shop_id: str, report_id: str) -> dict | None:
-    row = fetch_one("SELECT id, type, title, summary, content_markdown, status, created_at FROM business_reports WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, report_id))
+    row = fetch_one("SELECT id, type, title, summary, content_markdown, structured_json, status, created_at FROM business_reports WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, report_id))
     if not row:
         return None
-    return {"id": row["id"], "type": row["type"], "title": row["title"], "summary": row["summary"], "contentMarkdown": row.get("content_markdown") or row.get("summary") or "报告内容生成中。", "status": row["status"], "createdAt": str(row["created_at"])}
+    return {"id": row["id"], "type": row["type"], "title": row["title"], "summary": row["summary"], "contentMarkdown": row.get("content_markdown") or row.get("summary") or "报告内容生成中。", "structuredResult": parse_structured_json(row.get("structured_json")), "status": row["status"], "createdAt": str(row["created_at"])}
 
 
 def _report_job_type(report_type: str) -> str:

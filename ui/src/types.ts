@@ -18,6 +18,10 @@ export interface User {
   createdAt: string
   onboardingCompleted: boolean
   plan: string
+  tenantIds?: string[]
+  shopIds?: string[]
+  defaultTenantId?: string
+  defaultShopId?: string
 }
 
 export interface Shop {
@@ -60,11 +64,13 @@ export interface Product {
   category: string
   price: number
   stock: number
+  safetyStock?: number
   sales: number
   conversionRate: number
   riskLevel: RiskLevel
   layer: '爆品' | '潜力品' | '稳定品' | '稳态品' | '滞销品'
   riskReason: string
+  suggestedAction?: string
   aiSuggestion: string
 }
 
@@ -101,6 +107,17 @@ export interface Report {
 
 export interface ReportDetail extends Report {
   contentMarkdown: string
+  structuredResult?: StructuredResult | null
+}
+
+export interface StructuredResult {
+  conclusion?: string
+  evidence?: string[]
+  actions?: string[]
+  risks?: string[]
+  missingData?: string[]
+  stepSummaries?: Array<{ step?: string; label?: string; status?: string; summary?: string; latencyMs?: number; rows?: unknown[] }>
+  latencyMs?: number
 }
 
 export interface Strategy {

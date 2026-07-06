@@ -14,6 +14,7 @@ LangGraph 配置。拆到这里后，main_agent.py 只需要“创建 TaskRunCon
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -149,13 +150,33 @@ def _build_path_instruction(
     updated_info_prompt: str,
 ) -> str:
     """构造追加到用户问题后的工作环境提示，包括长期记忆召回结果。"""
+    started_at = time.perf_counter()
+    tracer.emit(
+        "memory_retrieval_started",
+        trace_id=task_id,
+        task_id=task_id,
+        conversation_id=conversation_id,
+        agent_name="memory_retriever",
+        metadata={"stage": "memory_retrieval", "status": "running"},
+    )
     long_term_memories = retrieve_long_term_memories(identity, task_query, top_k=5)
+    latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    tracer.emit(
+        "memory_retrieval_finished",
+        trace_id=task_id,
+        task_id=task_id,
+        conversation_id=conversation_id,
+        agent_name="memory_retriever",
+        latency_ms=latency_ms,
+        metadata={"stage": "memory_retrieval", "status": "completed", "count": len(long_term_memories), "retrieval": long_term_memories[0].get("retrieval") if long_term_memories else None},
+    )
     tracer.emit(
         "memory_retrieved",
         trace_id=task_id,
         task_id=task_id,
         conversation_id=conversation_id,
         agent_name="main_agent",
+        latency_ms=latency_ms,
         metadata={"count": len(long_term_memories), "retrieval": long_term_memories[0].get("retrieval") if long_term_memories else None},
     )
     memory_context = format_long_term_memory_context(long_term_memories)

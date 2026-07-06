@@ -19,9 +19,12 @@ func New(cfg config.Config, brainProxy *proxy.BrainProxy, authHandler *handlers.
 	engine.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.CORS())
 
 	engine.GET("/health", func(c *gin.Context) {
+		storeInfo := userStore.Backend()
 		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-			"brain":  cfg.PythonBrainURL.String(),
+			"status":             "ok",
+			"brain":              cfg.PythonBrainURL.String(),
+			"user_store_backend": storeInfo.Backend,
+			"mysql_database":     storeInfo.MySQLDatabase,
 		})
 	})
 
@@ -70,6 +73,23 @@ func registerV1Routes(engine *gin.Engine, brainProxy *proxy.BrainProxy, tokenMan
 	})
 	v1.POST("/onboarding/complete", brainProxy.ServeWithPath("/api/onboarding/complete"))
 	v1.POST("/ai-chat/messages", brainProxy.ServeWithPath("/api/ai-chat/messages"))
+	v1.GET("/ai-chat/conversations", brainProxy.ServeWithPath("/api/ai-chat/conversations"))
+	v1.GET("/ai-chat/conversations/:conversation_id/messages", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/ai-chat/conversations/" + c.Param("conversation_id") + "/messages"
+		brainProxy.Serve(c)
+	})
+	v1.GET("/ai-chat/messages/:message_id", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/ai-chat/messages/" + c.Param("message_id")
+		brainProxy.Serve(c)
+	})
+	v1.GET("/ai-chat/tasks/:task_id/timeline", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/ai-chat/tasks/" + c.Param("task_id") + "/timeline"
+		brainProxy.Serve(c)
+	})
+	v1.POST("/ai-chat/tasks/:task_id/cancel", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/ai-chat/tasks/" + c.Param("task_id") + "/cancel"
+		brainProxy.Serve(c)
+	})
 	v1.Any("/reports", brainProxy.ServeWithPath("/api/reports"))
 	v1.Any("/reports/*path", brainProxy.ServeWithPrefixReplace("/api/v1/reports", "/api/reports"))
 	v1.Any("/agents", brainProxy.ServeWithPath("/api/agents"))
@@ -107,6 +127,13 @@ func registerV1Routes(engine *gin.Engine, brainProxy *proxy.BrainProxy, tokenMan
 		brainProxy.Serve(c)
 	})
 	v1.GET("/metrics/agents", brainProxy.ServeWithPath("/api/metrics/agents"))
+	v1.GET("/agent-runtime/health", brainProxy.ServeWithPath("/api/agent-runtime/health"))
+	v1.GET("/agent-runtime/metrics", brainProxy.ServeWithPath("/api/agent-runtime/metrics"))
+	v1.GET("/agent-runtime/slow-tasks", brainProxy.ServeWithPath("/api/agent-runtime/slow-tasks"))
+	v1.GET("/agent-runtime/tasks/:task_id/diagnosis", func(c *gin.Context) {
+		c.Request.URL.Path = "/api/agent-runtime/tasks/" + c.Param("task_id") + "/diagnosis"
+		brainProxy.Serve(c)
+	})
 	v1.POST("/memories/search", brainProxy.ServeWithPath("/api/memories/search"))
 	v1.GET("/memories/reviews", brainProxy.ServeWithPath("/api/memories/reviews"))
 	v1.POST("/memories/reviews/:review_id/approve", func(c *gin.Context) {

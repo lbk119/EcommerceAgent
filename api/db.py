@@ -126,9 +126,9 @@ def ensure_platform_schema() -> None:
           tenant_id VARCHAR(64) NOT NULL,
           name VARCHAR(128) NOT NULL,
           category VARCHAR(128) NOT NULL DEFAULT '',
-          platform VARCHAR(64) NOT NULL DEFAULT '淘宝 / 天猫',
-          shop_type VARCHAR(32) NOT NULL DEFAULT '品牌自营',
-          business_stage VARCHAR(32) NOT NULL DEFAULT '成长期',
+          platform VARCHAR(64) NOT NULL DEFAULT 'taobao_tmall',
+          shop_type VARCHAR(32) NOT NULL DEFAULT 'brand_owned',
+          business_stage VARCHAR(32) NOT NULL DEFAULT 'growth',
           status VARCHAR(32) NOT NULL DEFAULT 'active',
           auth_status VARCHAR(32) NOT NULL DEFAULT 'pending',
           data_status VARCHAR(32) NOT NULL DEFAULT 'empty',
@@ -181,6 +181,7 @@ def ensure_platform_schema() -> None:
           title VARCHAR(255) NOT NULL,
           summary TEXT NOT NULL,
           content_markdown MEDIUMTEXT NULL,
+          structured_json JSON NULL,
           status VARCHAR(32) NOT NULL DEFAULT 'draft',
           source_task_id VARCHAR(64) NULL,
           created_by VARCHAR(64) NOT NULL,
@@ -202,6 +203,7 @@ def ensure_platform_schema() -> None:
           conversation_id VARCHAR(64) NULL,
           params_json JSON NULL,
           result_report_id VARCHAR(64) NULL,
+          result_summary_json JSON NULL,
           error_message TEXT NULL,
           created_by VARCHAR(64) NOT NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -224,6 +226,64 @@ def ensure_platform_schema() -> None:
           reviewed_at DATETIME NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
+                """
+                CREATE TABLE IF NOT EXISTS ai_chat_conversations (
+                    id VARCHAR(64) PRIMARY KEY,
+                    tenant_id VARCHAR(64) NOT NULL,
+                    shop_id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_ai_chat_conversations_scope (tenant_id, shop_id, user_id, updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS ai_chat_messages (
+                    id VARCHAR(64) PRIMARY KEY,
+                    tenant_id VARCHAR(64) NOT NULL,
+                    shop_id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    conversation_id VARCHAR(64) NOT NULL,
+                    role VARCHAR(16) NOT NULL,
+                    content MEDIUMTEXT NULL,
+                    structured_json JSON NULL,
+                    source VARCHAR(32) NULL,
+                    status VARCHAR(32) NULL,
+                    task_id VARCHAR(64) NULL,
+                    intent VARCHAR(64) NULL,
+                    error_message TEXT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_ai_chat_messages_conversation (tenant_id, shop_id, user_id, conversation_id, created_at),
+                    KEY idx_ai_chat_messages_task (tenant_id, shop_id, task_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS ai_chat_runs (
+                    id VARCHAR(64) PRIMARY KEY,
+                    tenant_id VARCHAR(64) NOT NULL,
+                    shop_id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    conversation_id VARCHAR(64) NOT NULL,
+                    message_id VARCHAR(64) NOT NULL,
+                    task_id VARCHAR(64) NOT NULL,
+                    user_content MEDIUMTEXT NOT NULL,
+                    assistant_content MEDIUMTEXT NULL,
+                    structured_json JSON NULL,
+                    intent VARCHAR(64) NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'queued',
+                    source VARCHAR(32) NOT NULL DEFAULT 'agent',
+                    error_message TEXT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    completed_at DATETIME NULL,
+                    UNIQUE KEY uk_ai_chat_runs_task (task_id),
+                    KEY idx_ai_chat_runs_conversation (tenant_id, shop_id, user_id, conversation_id, created_at),
+                    KEY idx_ai_chat_runs_message (tenant_id, shop_id, message_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """,
     ]
     for statement in statements:
         execute(statement)
@@ -231,9 +291,9 @@ def ensure_platform_schema() -> None:
     # 老版本 gateway_shops 可能只有 auth_status/data_status；逐列补齐产品字段。
     for column_name, ddl in {
         "category": "ALTER TABLE gateway_shops ADD COLUMN category VARCHAR(128) NOT NULL DEFAULT ''",
-        "platform": "ALTER TABLE gateway_shops ADD COLUMN platform VARCHAR(64) NOT NULL DEFAULT '淘宝 / 天猫'",
-        "shop_type": "ALTER TABLE gateway_shops ADD COLUMN shop_type VARCHAR(32) NOT NULL DEFAULT '品牌自营'",
-        "business_stage": "ALTER TABLE gateway_shops ADD COLUMN business_stage VARCHAR(32) NOT NULL DEFAULT '成长期'",
+        "platform": "ALTER TABLE gateway_shops ADD COLUMN platform VARCHAR(64) NOT NULL DEFAULT 'taobao_tmall'",
+        "shop_type": "ALTER TABLE gateway_shops ADD COLUMN shop_type VARCHAR(32) NOT NULL DEFAULT 'brand_owned'",
+        "business_stage": "ALTER TABLE gateway_shops ADD COLUMN business_stage VARCHAR(32) NOT NULL DEFAULT 'growth'",
         "status": "ALTER TABLE gateway_shops ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'",
         "last_sync_at": "ALTER TABLE gateway_shops ADD COLUMN last_sync_at DATETIME NULL",
     }.items():
@@ -242,7 +302,15 @@ def ensure_platform_schema() -> None:
     for column_name, ddl in {
         "params_json": "ALTER TABLE agent_jobs ADD COLUMN params_json JSON NULL",
         "result_report_id": "ALTER TABLE agent_jobs ADD COLUMN result_report_id VARCHAR(64) NULL",
+        "result_summary_json": "ALTER TABLE agent_jobs ADD COLUMN result_summary_json JSON NULL",
     }.items():
         if table_exists("agent_jobs") and not column_exists("agent_jobs", column_name):
+            execute(ddl)
+    for table_name, column_name, ddl in (
+        ("business_reports", "structured_json", "ALTER TABLE business_reports ADD COLUMN structured_json JSON NULL"),
+        ("ai_chat_messages", "structured_json", "ALTER TABLE ai_chat_messages ADD COLUMN structured_json JSON NULL"),
+        ("ai_chat_runs", "structured_json", "ALTER TABLE ai_chat_runs ADD COLUMN structured_json JSON NULL"),
+    ):
+        if table_exists(table_name) and not column_exists(table_name, column_name):
             execute(ddl)
     _platform_schema_ready = True

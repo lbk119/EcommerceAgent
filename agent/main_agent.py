@@ -11,57 +11,89 @@ AgentRuntime 负责 prepare_context / retrieve_memory / execute_agent / run_crit
 write_memory / finalize_trace；具体的结果落盘和记忆写入仍复用 result_pipeline.py。
 """
 
-from deepagents import create_deep_agent
-
 from agent import prompts
 from agent.core.tool_registry import MAIN_AGENT_PERMISSIONS, MAIN_AGENT_TOOLS, tool_registry
-from agent.llm import get_reasoning_model
-from agent.memory.checkpoint import build_checkpointer
 from agent.runtime.agent_runtime import AgentRuntime
-from agent.sub_agents.database_query_agent import database_query_agent, database_query_agent_spec
-from agent.sub_agents.knowledge_base_agent import knowledge_base_agent, knowledge_base_agent_spec
-from agent.sub_agents.network_search_agent import network_search_agent, network_search_agent_spec
+from agent.runtime.profiles import get_runtime_profile, normalize_runtime_profile
 
 
-# DeepAgents 子 Agent 仍然由各自模块定义；这里仅负责组装主图。
-subagents_list = [
-    knowledge_base_agent,
-    database_query_agent,
-    network_search_agent,
-]
-subagent_specs = [
-    knowledge_base_agent_spec,
-    database_query_agent_spec,
-    network_search_agent_spec,
-]
-
-agent_checkpointer = build_checkpointer()
+_AGENT_CACHE = {}
+_SPEC_CACHE = {}
 
 
-def build_main_agent():
+def build_main_agent(profile: str = "deep"):
     """
-    构建主 DeepAgents 图。
+    按 profile 构建主 DeepAgents 图。
 
     主 Agent 的工具不直接 import 裸函数，而是通过 ToolRegistry 取 guarded tools。
     这样 ToolSpec.permissions/risk 会在运行时真正生效，后续权限治理也只需要扩展 registry/security 层。
     """
+    from deepagents import create_deep_agent
+    from agent.llm import get_deep_model, get_standard_model
+
+    runtime_profile = get_runtime_profile(profile)
+    if runtime_profile.agent_mode == "none":
+        raise ValueError("realtime profile 不构建 DeepAgent，请使用 ChatAgentRuntime。")
+    subagents_list, subagent_specs = _subagents_for_profile(runtime_profile.name)
+    checkpointer = _checkpointer_for_profile(runtime_profile.name)
+    model = get_deep_model() if runtime_profile.name == "deep" else get_standard_model()
     return create_deep_agent(
-        model=get_reasoning_model(),
+        model=model,
         tools=tool_registry.tools(MAIN_AGENT_TOOLS, MAIN_AGENT_PERMISSIONS, "main_agent"),
         subagents=subagents_list,
         system_prompt=prompts.main_agent_content["system_prompt"],
-        checkpointer=agent_checkpointer,
+        checkpointer=checkpointer,
     )
 
 
-main_agent = build_main_agent()
+def get_deep_agent(profile: str = "deep"):
+    """懒加载 DeepAgent；导入 main_agent.py 不再构建模型、subagents、tools 或 checkpointer。"""
+    normalized = normalize_runtime_profile(profile)
+    if normalized == "realtime":
+        raise ValueError("realtime profile 不允许构建 DeepAgent")
+    if normalized not in _AGENT_CACHE:
+        _AGENT_CACHE[normalized] = build_main_agent(normalized)
+    return _AGENT_CACHE[normalized], _SPEC_CACHE.get(normalized, [])
 
 
 def reload_agent_policy():
     """热重载 prompt/policy 后重建主图，保持 API 层入口不变。"""
-    global main_agent
+    global _AGENT_CACHE, _SPEC_CACHE
     prompts.reload_prompts()
-    main_agent = build_main_agent()
+    _AGENT_CACHE = {}
+    _SPEC_CACHE = {}
+
+
+def _subagents_for_profile(profile: str):
+    """按 profile 裁剪 subagent；standard 默认只保留可预算约束的数据库助手，deep 才允许可选外部搜索。"""
+    from agent.sub_agents.database_query_agent import database_query_agent, database_query_agent_spec
+
+    subagents = [database_query_agent]
+    specs = [database_query_agent_spec]
+    if profile == "deep":
+        import os
+
+        if os.getenv("DEEP_AGENT_ENABLE_KNOWLEDGE_BASE", "false").lower() in {"1", "true", "yes", "on"}:
+            from agent_extensions.deep_subagents.knowledge_base_agent import knowledge_base_agent, knowledge_base_agent_spec
+
+            subagents.append(knowledge_base_agent)
+            specs.append(knowledge_base_agent_spec)
+        if os.getenv("DEEP_AGENT_ENABLE_NETWORK_SEARCH", "false").lower() in {"1", "true", "yes", "on"}:
+            from agent_extensions.deep_subagents.network_search_agent import network_search_agent, network_search_agent_spec
+
+            subagents.append(network_search_agent)
+            specs.append(network_search_agent_spec)
+    _SPEC_CACHE[profile] = specs
+    return subagents, specs
+
+
+def _checkpointer_for_profile(profile: str):
+    """只给 deep profile 启用 checkpointer，standard/realtime 不在热路径初始化。"""
+    if profile != "deep":
+        return None
+    from agent_extensions.checkpointing.checkpoint import build_checkpointer
+
+    return build_checkpointer()
 
 
 async def run_deep_agent(
@@ -71,6 +103,7 @@ async def run_deep_agent(
     tenant_id="default_tenant",
     user_id="local_user",
     shop_id="default_shop",
+    runtime_profile="full",
 ):
     """
     FastAPI 后台任务调用的稳定入口。
@@ -79,7 +112,8 @@ async def run_deep_agent(
     Critic retry、记忆写入和 trace 收尾都由 AgentRuntime 统一编排。
     """
     print(f"当前会话的main_agent开始执行了！ conversation_id:{conversation_id} task_id:{task_id}")
-    runtime = AgentRuntime(main_agent, subagent_specs)
+    agent, subagent_specs = get_deep_agent(runtime_profile)
+    runtime = AgentRuntime(agent, subagent_specs)
     return await runtime.run(
         task_query,
         conversation_id=conversation_id,
@@ -87,4 +121,5 @@ async def run_deep_agent(
         tenant_id=tenant_id,
         user_id=user_id,
         shop_id=shop_id,
+        runtime_profile=runtime_profile,
     )

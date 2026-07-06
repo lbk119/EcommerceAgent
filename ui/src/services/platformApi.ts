@@ -1,5 +1,5 @@
 import { completeOnboarding as mockCompleteOnboarding, loadSession as mockLoadSession, loginWithMock, logoutMock, registerWithMock, saveSession as mockSaveSession } from './mockAuth'
-import type { AuthSession, IntegrationStatus, LoginPayload, OnboardingPayload, RegisterPayload, ReportDetail, Shop, StrategyStatus, User, WorkspaceData } from '../types'
+import type { AuthSession, IntegrationStatus, LoginPayload, OnboardingPayload, RegisterPayload, ReportDetail, Shop, StrategyStatus, StructuredResult, User, WorkspaceData } from '../types'
 
 const STORAGE_KEY = 'ecompilot_session'
 const API_BASE = '/api/v1'
@@ -57,6 +57,86 @@ export type ImportRefreshResult = {
   job: ImportJobResult
 }
 
+export type AiChatMessage = {
+  id?: string
+  role: 'user' | 'assistant'
+  content: string
+  source?: 'agent' | 'workflow' | 'deep_agent' | 'agent_timeout' | 'error' | string
+  status?: 'queued' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled' | string
+  taskId?: string
+  conversationId?: string
+  intent?: string
+  errorMessage?: string
+  structuredResult?: StructuredResult | null
+}
+
+export type AiChatConversation = {
+  id: string
+  title: string
+  status: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type AiChatAccepted = {
+  messageId: string
+  conversationId: string
+  taskId: string
+  status: string
+  source: string
+  wsThreadId: string
+  intent?: string
+  acceptedLatencyMs?: number
+  message: AiChatMessage
+}
+
+type RawAiChatMessage = Partial<AiChatMessage> & Record<string, unknown>
+type RawAiChatAccepted = Partial<AiChatAccepted> & Record<string, unknown>
+
+export type AgentProgressEvent = {
+  type: 'agent_progress' | 'assistant_delta' | 'assistant_final' | 'agent_error' | 'monitor_event' | 'pong' | string
+  event?: string
+  eventType?: string
+  message?: string
+  title?: string
+  detail?: string
+  timestamp?: string
+  taskId?: string
+  messageId?: string
+  conversationId?: string
+  stage?: string
+  status?: string
+  latencyMs?: number
+  delta?: string
+  content?: string
+  source?: string
+  totalLatencyMs?: number
+  errorMessage?: string
+  recoverable?: boolean
+  display?: { group?: string; importance?: 'high' | 'normal' | 'low' | string; collapsible?: boolean }
+  data?: Record<string, unknown>
+}
+
+export type AiChatTimelineEvent = {
+  timestamp?: string
+  event_type?: string
+  agent_name?: string
+  workflow_name?: string
+  step_name?: string
+  latency_ms?: number
+  error?: string
+}
+
+export type AgentRuntimeHealth = {
+  agentRuntime: string
+  taskQueue: Record<string, unknown>
+  taskRuntime?: Record<string, unknown>
+  monitor: Record<string, unknown>
+  tracer: Record<string, unknown>
+  memory: Record<string, unknown>
+  evolution: Record<string, unknown>
+}
+
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
 export const loadSession = (): AuthSession | null => {
@@ -86,13 +166,17 @@ async function requestJson<T>(path: string, options: RequestOptions = {}): Promi
   if (options.session?.token) headers.set('Authorization', `Bearer ${options.session.token}`)
   if (options.session?.workspace.currentShopId) headers.set('X-Shop-ID', options.session.workspace.currentShopId)
 
+  const hasAuthHeader = headers.has('Authorization')
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
   const text = await response.text()
   const data = parseResponseBody(text)
   if (response.status === 401) {
-    logout()
-    window.dispatchEvent(new CustomEvent('ecompilot:auth-expired'))
-    throw new Error('登录已过期，请重新登录')
+    if (options.session?.token || hasAuthHeader) {
+      logout()
+      window.dispatchEvent(new CustomEvent('ecompilot:auth-expired'))
+      throw new Error('登录已过期，请重新登录')
+    }
+    throw new Error(extractErrorMessage(data, text) || '账号或密码错误')
   }
   if (!response.ok) {
     throw new Error(extractErrorMessage(data, text))
@@ -144,7 +228,11 @@ function normalizeUser(raw: AuthResponse['user']): User {
     role: String(raw.role || 'admin'),
     createdAt: String(raw.createdAt || raw.created_at || new Date().toISOString()),
     onboardingCompleted: Boolean(raw.onboardingCompleted ?? raw.onboarding_completed),
-    plan: String(raw.plan || '团队版')
+    plan: String(raw.plan || '团队版'),
+    tenantIds: Array.isArray(raw.tenantIds) ? raw.tenantIds.map(String) : Array.isArray(raw.tenant_ids) ? raw.tenant_ids.map(String) : [],
+    shopIds: Array.isArray(raw.shopIds) ? raw.shopIds.map(String) : Array.isArray(raw.shop_ids) ? raw.shop_ids.map(String) : [],
+    defaultTenantId: String(raw.defaultTenantId || raw.default_tenant_id || ''),
+    defaultShopId: String(raw.defaultShopId || raw.default_shop_id || '')
   }
 }
 
@@ -168,6 +256,7 @@ export async function fetchWorkspace(session: AuthSession): Promise<WorkspaceDat
 
 export async function login(payload: LoginPayload): Promise<AuthSession> {
   return withMockFallback(
+    // 登录只做认证并保存 token/user，工作区聚合由 App 在跳转后后台刷新，避免登录按钮被慢查询卡住。
     () => requestJson<AuthResponse>('/auth/login', { method: 'POST', body: JSON.stringify(payload) }).then(sessionFromAuth),
     () => loginWithMock(payload)
   )
@@ -184,13 +273,19 @@ export async function completeOnboarding(session: AuthSession, payload: Onboardi
   return withMockFallback(async () => {
     const data = await requestJson<{ workspace: WorkspaceData }>('/onboarding/complete', { method: 'POST', body: JSON.stringify(payload), session })
     let user = { ...session.user, onboardingCompleted: true }
+    let token = session.token
     try {
-      const account = await requestJson<{ user: Partial<User> & Record<string, unknown> }>('/account/onboarding-completed', { method: 'POST', body: JSON.stringify({}), session })
+      const account = await requestJson<AuthResponse>('/auth/shops', { method: 'POST', body: JSON.stringify({ shop_id: data.workspace.currentShopId, shop_name: data.workspace.shops[0]?.name }), session })
       user = normalizeUser(account.user)
+      token = account.accessToken || account.access_token || token
+      const accountSession = { ...session, token, user, workspace: data.workspace }
+      const completed = await requestJson<{ user: Partial<User> & Record<string, unknown> }>('/account/onboarding-completed', { method: 'POST', body: JSON.stringify({}), session: accountSession })
+      user = normalizeUser(completed.user)
     } catch {
-      // Brain 的引导已经完成；账号标记失败时保留前端会话态，避免阻断首次进入工作台。
+      // Brain 的引导已经完成；账号店铺绑定失败时保留前端会话态，避免阻断首次进入工作台。
+      user = { ...user, onboardingCompleted: true }
     }
-    const nextSession = { ...session, user, workspace: data.workspace }
+    const nextSession = { ...session, token, user, workspace: data.workspace }
     saveSession(nextSession)
     return nextSession
   }, () => mockCompleteOnboarding(session, payload))
@@ -231,7 +326,7 @@ export async function setIntegration(session: AuthSession, platform: string, sta
 export async function setStrategyStatus(session: AuthSession, strategyId: string, status: StrategyStatus): Promise<AuthSession> {
   const actionByStatus: Record<StrategyStatus, string> = { accepted: 'approve', rejected: 'reject', deferred: 'defer', pending: 'defer' }
   await requestJson(`/agents/strategies/${strategyId}/${actionByStatus[status]}`, { method: 'POST', session })
-  return refreshWorkspace(session)
+  return session
 }
 
 export async function startAgentJob(session: AuthSession, agentId: string, title: string): Promise<AgentJob> {
@@ -249,6 +344,11 @@ export async function uploadImportFile(session: AuthSession, file: File): Promis
   const body = new FormData()
   body.append('file', file)
   const data = await requestJson<{ job: { id: string; fileName: string; status: string } }>('/data-import/upload', { method: 'POST', body, session })
+  return data.job
+}
+
+export async function pasteImportText(session: AuthSession, text: string): Promise<{ id: string; fileName: string; status: string }> {
+  const data = await requestJson<{ job: { id: string; fileName: string; status: string } }>('/data-import/paste', { method: 'POST', body: JSON.stringify({ text }), session })
   return data.job
 }
 
@@ -300,9 +400,81 @@ export async function getReport(session: AuthSession, reportId: string): Promise
   return data.report
 }
 
-export async function sendAiMessage(session: AuthSession, content: string): Promise<string> {
-  const data = await requestJson<{ message: { content: string } }>('/ai-chat/messages', { method: 'POST', body: JSON.stringify({ content }), session })
-  return data.message.content
+export async function sendAiMessage(session: AuthSession, content: string, conversationId?: string): Promise<AiChatAccepted> {
+  const data = await requestJson<RawAiChatAccepted>('/ai-chat/messages', { method: 'POST', body: JSON.stringify({ content, conversationId }), session })
+  return normalizeAiChatAccepted(data)
+}
+
+export async function getAiChatMessage(session: AuthSession, messageId: string): Promise<AiChatMessage> {
+  const data = await requestJson<{ message: RawAiChatMessage }>(`/ai-chat/messages/${messageId}`, { method: 'GET', session })
+  return normalizeAiChatMessage(data.message)
+}
+
+export async function getAiChatTimeline(session: AuthSession, taskId: string): Promise<{ task_id: string; events: AiChatTimelineEvent[]; run?: Record<string, unknown> }> {
+  return requestJson<{ task_id: string; events: AiChatTimelineEvent[]; run?: Record<string, unknown> }>(`/ai-chat/tasks/${taskId}/timeline`, { method: 'GET', session })
+}
+
+export async function listAiChatConversations(session: AuthSession): Promise<AiChatConversation[]> {
+  const data = await requestJson<{ conversations: AiChatConversation[] }>('/ai-chat/conversations', { method: 'GET', session })
+  return data.conversations
+}
+
+export async function fetchAiChatMessages(session: AuthSession, conversationId: string): Promise<AiChatMessage[]> {
+  const data = await requestJson<{ messages: RawAiChatMessage[] }>(`/ai-chat/conversations/${conversationId}/messages`, { method: 'GET', session })
+  return data.messages.map(normalizeAiChatMessage)
+}
+
+function normalizeAiChatAccepted(data: RawAiChatAccepted): AiChatAccepted {
+  const message = normalizeAiChatMessage((data.message as RawAiChatMessage | undefined) || {})
+  return {
+    messageId: String(data.messageId || data.message_id || message.id || ''),
+    conversationId: String(data.conversationId || data.conversation_id || message.conversationId || ''),
+    taskId: String(data.taskId || data.task_id || message.taskId || ''),
+    status: String(data.status || message.status || 'running'),
+    source: String(data.source || message.source || 'agent'),
+    wsThreadId: String(data.wsThreadId || data.ws_thread_id || data.conversationId || data.conversation_id || message.conversationId || ''),
+    intent: typeof data.intent === 'string' ? data.intent : message.intent,
+    acceptedLatencyMs: typeof data.acceptedLatencyMs === 'number' ? data.acceptedLatencyMs : typeof data.accepted_latency_ms === 'number' ? data.accepted_latency_ms : undefined,
+    message
+  }
+}
+
+function normalizeAiChatMessage(message: RawAiChatMessage): AiChatMessage {
+  return {
+    id: typeof message.id === 'string' ? message.id : typeof message.messageId === 'string' ? message.messageId : typeof message.message_id === 'string' ? message.message_id : undefined,
+    role: message.role === 'user' ? 'user' : 'assistant',
+    content: String(message.content || message.assistantContent || message.assistant_content || ''),
+    source: typeof message.source === 'string' ? message.source : undefined,
+    status: typeof message.status === 'string' ? message.status : undefined,
+    taskId: typeof message.taskId === 'string' ? message.taskId : typeof message.task_id === 'string' ? message.task_id : undefined,
+    conversationId: typeof message.conversationId === 'string' ? message.conversationId : typeof message.conversation_id === 'string' ? message.conversation_id : undefined,
+    intent: typeof message.intent === 'string' ? message.intent : undefined,
+    errorMessage: typeof message.errorMessage === 'string' ? message.errorMessage : typeof message.error_message === 'string' ? message.error_message : undefined,
+    structuredResult: (message.structuredResult || message.structured_result || null) as StructuredResult | null
+  }
+}
+
+export async function getAgentRuntimeHealth(session: AuthSession): Promise<AgentRuntimeHealth> {
+  return requestJson<AgentRuntimeHealth>('/agent-runtime/health', { method: 'GET', session })
+}
+
+export function connectAgentProgress(session: AuthSession, conversationId: string, onEvent: (event: AgentProgressEvent) => void, onDisconnect?: () => void): WebSocket {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const params = new URLSearchParams({ token: session.token })
+  if (session.user.defaultTenantId) params.set('tenant_id', session.user.defaultTenantId)
+  if (session.workspace.currentShopId) params.set('shop_id', session.workspace.currentShopId)
+  const socket = new WebSocket(`${protocol}//${window.location.host}${API_BASE}/ws/${encodeURIComponent(conversationId)}?${params.toString()}`)
+  socket.onopen = () => socket.send(JSON.stringify({ type: 'hello', conversationId }))
+  socket.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as AgentProgressEvent)
+    } catch {
+      onEvent({ type: 'raw', message: String(message.data) })
+    }
+  }
+  socket.onclose = () => onDisconnect?.()
+  socket.onerror = () => onDisconnect?.()
+  return socket
 }
 
 export const loadMockSession = mockLoadSession

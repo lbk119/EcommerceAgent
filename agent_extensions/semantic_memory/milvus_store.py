@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from mysql.connector import connect
 
-from agent.memory.embedding import EmbeddingUnavailable, embed_text, embedding_dimension, embedding_model_name
+from agent_extensions.semantic_memory.embedding import EmbeddingUnavailable, embed_text, embedding_dimension, embedding_model_name
 from agent.memory.schema import MemoryCandidate, MemoryIdentity, namespace_for, utc_now
 from agent.core.db import get_db_config
 

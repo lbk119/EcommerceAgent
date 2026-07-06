@@ -12,6 +12,7 @@ from typing import Any
 
 from api.db import execute, fetch_all, fetch_one
 from api.services.business_text import build_strategy_candidates_from_agent_result, markdown_summary
+from api.services.result_payload import result_markdown, structured_json
 
 
 REPORT_JOB_TYPES = {
@@ -46,17 +47,18 @@ async def finalize_agent_job_success(
     job = _find_job(tenant_id, shop_id, task_id)
     if not job:
         return
-    report_content = final_result.strip() or "报告已生成，但内容为空，请重新运行。"
+    report_content = result_markdown(final_result).strip() or "报告已生成，但内容为空，请重新运行。"
+    result_json = structured_json(final_result)
     summary = markdown_summary(report_content)
     execute(
         """
         UPDATE agent_jobs
-        SET status='completed', error_message=NULL, updated_at=NOW()
+        SET status='completed', result_summary_json=%s, error_message=NULL, updated_at=NOW()
         WHERE tenant_id=%s AND shop_id=%s AND task_id=%s
         """,
-        (tenant_id, shop_id, task_id),
+        (result_json, tenant_id, shop_id, task_id),
     )
-    _upsert_report_for_job(tenant_id, shop_id, user_id, job, task_id, report_content, summary)
+    _upsert_report_for_job(tenant_id, shop_id, user_id, job, task_id, report_content, summary, result_json)
     _insert_strategy_candidates(tenant_id, shop_id, task_id, build_strategy_candidates_from_agent_result(report_content, job))
 
 
@@ -119,17 +121,17 @@ def _find_job(tenant_id: str, shop_id: str, task_id: str) -> dict[str, Any] | No
     )
 
 
-def _upsert_report_for_job(tenant_id: str, shop_id: str, user_id: str, job: dict[str, Any], task_id: str, final_result: str, summary: str) -> str | None:
+def _upsert_report_for_job(tenant_id: str, shop_id: str, user_id: str, job: dict[str, Any], task_id: str, final_result: str, summary: str, structured_result_json: str | None) -> str | None:
     """更新或创建任务产出的经营报告。"""
     report_id = job.get("result_report_id")
     if report_id:
         execute(
             """
             UPDATE business_reports
-            SET content_markdown=%s, summary=%s, status='ready', source_task_id=%s, updated_at=NOW()
+            SET content_markdown=%s, structured_json=%s, summary=%s, status='ready', source_task_id=%s, updated_at=NOW()
             WHERE tenant_id=%s AND shop_id=%s AND id=%s
             """,
-            (final_result, summary, task_id, tenant_id, shop_id, report_id),
+            (final_result, structured_result_json, summary, task_id, tenant_id, shop_id, report_id),
         )
         return str(report_id)
 
@@ -149,20 +151,20 @@ def _upsert_report_for_job(tenant_id: str, shop_id: str, user_id: str, job: dict
         execute(
             """
             UPDATE business_reports
-            SET content_markdown=%s, summary=%s, status='ready', updated_at=NOW()
+            SET content_markdown=%s, structured_json=%s, summary=%s, status='ready', updated_at=NOW()
             WHERE tenant_id=%s AND shop_id=%s AND id=%s
             """,
-            (final_result, summary, tenant_id, shop_id, report_id),
+            (final_result, structured_result_json, summary, tenant_id, shop_id, report_id),
         )
         return str(report_id)
 
     report_id = str(uuid.uuid4())
     execute(
         """
-        INSERT INTO business_reports (id, tenant_id, shop_id, type, title, summary, content_markdown, status, source_task_id, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s)
+        INSERT INTO business_reports (id, tenant_id, shop_id, type, title, summary, content_markdown, structured_json, status, source_task_id, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s)
         """,
-        (report_id, tenant_id, shop_id, report_type, job.get("title") or "数字员工报告", summary, final_result, task_id, user_id),
+        (report_id, tenant_id, shop_id, report_type, job.get("title") or "数字员工报告", summary, final_result, structured_result_json, task_id, user_id),
     )
     execute(
         """

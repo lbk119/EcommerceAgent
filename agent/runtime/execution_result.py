@@ -1,8 +1,8 @@
 """
 ExecutionResult 是 AgentRuntime 内部的执行结果结构。
 
-对外 API 仍返回字符串；运行时内部保留 source、workflow sections 和 time_range，便于 Critic
-修正、trace 和后续审计不丢失 deterministic workflow 的执行上下文。
+对外 API 仍兼容字符串；运行时内部保留 source、workflow sections、time_range 和 structured_result，
+便于前端用结构化卡片展示，同时保留 Markdown 给复制和导出。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ class ExecutionResult:
     fallback_reason: str = ""
     attempted_workflow: str = ""
     workflow_failed: bool = False
+    structured_result: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_deepagent(cls, content: str, *, fallback_reason: str = "", attempted_workflow: str = "", workflow_failed: bool = False) -> "ExecutionResult":
@@ -39,6 +40,9 @@ class ExecutionResult:
     def to_text(self) -> str:
         return self.content
 
+    def to_final_result(self, content: str | None = None) -> "FinalResult":
+        return FinalResult(content=content or self.content, structured_result=self.structured_result)
+
     def section_errors(self) -> Dict[str, str]:
         """返回 workflow 中失败或缺失的 section，供记忆质量门控使用。"""
         return {
@@ -46,3 +50,14 @@ class ExecutionResult:
             for name, content in self.sections.items()
             if content.strip().startswith("section_error:")
         }
+
+
+@dataclass(frozen=True)
+class FinalResult:
+    """跨 API/service 层传递的最终结果；旧代码把它转成 str 仍得到 Markdown。"""
+
+    content: str
+    structured_result: Dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return self.content

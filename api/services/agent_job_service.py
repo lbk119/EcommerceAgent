@@ -7,6 +7,7 @@ import json
 
 from api.db import ensure_platform_schema, execute, fetch_all, fetch_one
 from api.services.job_result_service import finalize_agent_job_failure, finalize_agent_job_success
+from api.services.result_payload import parse_structured_json
 from api.services.agent_job_prompts import build_agent_query
 from api.services.ecommerce_queries import AGENT_DEFINITIONS, normalize_time
 from api.task_queue import task_queue
@@ -31,6 +32,7 @@ async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id:
     task_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     result_report_id = params.get("reportId") or params.get("report_id")
+    runtime_profile = str(payload.get("runtimeProfile") or payload.get("runtime_profile") or _runtime_profile_for_job(job_type))
     execute(
         """
         INSERT INTO agent_jobs (id, tenant_id, shop_id, agent_id, agent_name, job_type, title, status, task_id, conversation_id, params_json, result_report_id, created_by)
@@ -38,9 +40,15 @@ async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id:
         """,
         (job_id, tenant_id, shop_id, agent_id, agent_name(agent_id), job_type, title, task_id, conversation_id, json.dumps(params, ensure_ascii=False), result_report_id, user_id),
     )
-    await task_runtime.enqueue(task_id, query, metadata={"conversation_id": conversation_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "agent_job_id": job_id})
-    await task_queue.enqueue({"query": query, "conversation_id": conversation_id, "thread_id": conversation_id, "task_id": task_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id})
-    return {"id": job_id, "jobId": job_id, "agentId": agent_id, "jobType": job_type, "title": title, "status": "running", "taskId": task_id, "conversationId": conversation_id, "resultReportId": result_report_id}
+    await task_runtime.enqueue(task_id, query, metadata={"conversation_id": conversation_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "agent_job_id": job_id, "runtime_profile": runtime_profile})
+    await task_queue.enqueue({"query": query, "conversation_id": conversation_id, "thread_id": conversation_id, "task_id": task_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "runtime_profile": runtime_profile, "job_type": job_type, "source": "agent_job"})
+    return {"id": job_id, "jobId": job_id, "agentId": agent_id, "jobType": job_type, "title": title, "status": "running", "taskId": task_id, "conversationId": conversation_id, "resultReportId": result_report_id, "runtimeProfile": runtime_profile}
+
+
+def _runtime_profile_for_job(job_type: str | None) -> str:
+    """数字员工默认走 standard；管理层报告和复杂周期报告才走 deep。"""
+    deep_job_types = {"weekly_report", "monthly_report", "management_report", "strategy_diagnosis", "cross_platform_attribution"}
+    return "deep" if str(job_type or "") in deep_job_types else "standard"
 
 
 def list_agent_jobs(tenant_id: str, shop_id: str, agent_id: str | None = None) -> list[dict]:
@@ -82,13 +90,19 @@ async def sync_agent_job_from_runtime(tenant_id: str, shop_id: str, user_id: str
             user_id=user_id,
             task_id=row["task_id"],
             conversation_id=row.get("conversation_id") or "",
-            final_result=str(state.get("result") or ""),
+            final_result=_runtime_result_from_state(state),
             execution_metadata={"syncedFromRuntime": True},
         )
 
 
 def get_agent_job(tenant_id: str, shop_id: str, job_id: str) -> dict | None:
-    row = fetch_one("SELECT id, agent_id, agent_name, job_type, title, status, task_id, conversation_id, result_report_id, error_message, created_at FROM agent_jobs WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, job_id))
+    row = fetch_one("SELECT id, agent_id, agent_name, job_type, title, status, task_id, conversation_id, result_report_id, result_summary_json, error_message, created_at FROM agent_jobs WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, job_id))
     if not row:
         return None
-    return {"id": row["id"], "jobId": row["id"], "agentId": row["agent_id"], "agentName": row["agent_name"], "jobType": row["job_type"], "title": row["title"], "status": row["status"], "taskId": row.get("task_id"), "conversationId": row.get("conversation_id"), "resultReportId": row.get("result_report_id"), "errorMessage": row.get("error_message"), "createdAt": normalize_time(row["created_at"])}
+    return {"id": row["id"], "jobId": row["id"], "agentId": row["agent_id"], "agentName": row["agent_name"], "jobType": row["job_type"], "title": row["title"], "status": row["status"], "taskId": row.get("task_id"), "conversationId": row.get("conversation_id"), "resultReportId": row.get("result_report_id"), "structuredResult": parse_structured_json(row.get("result_summary_json")), "errorMessage": row.get("error_message"), "createdAt": normalize_time(row["created_at"])}
+
+
+def _runtime_result_from_state(state: dict):
+    from agent.runtime.execution_result import FinalResult
+
+    return FinalResult(content=str(state.get("result") or ""), structured_result=state.get("structured_result") or {})

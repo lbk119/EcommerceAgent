@@ -27,10 +27,15 @@ func main() {
 		gin.SetMode(cfg.Mode)
 	}
 
-	userStore, err := auth.NewUserStoreFromConfig(cfg.UserStoreBackend)
+	userStore, err := auth.NewUserStoreFromConfig(cfg.UserStoreBackend, cfg.Mode)
 	if err != nil {
 		slog.Error("initialize gateway user store", "backend", cfg.UserStoreBackend, "error", err)
 		os.Exit(1)
+	}
+	storeInfo := userStore.Backend()
+	slog.Info("[Gateway] user store backend: "+storeInfo.Backend, "backend", storeInfo.Backend)
+	if storeInfo.MySQLDatabase != "" {
+		slog.Info("[Gateway] mysql database: "+storeInfo.MySQLDatabase, "database", storeInfo.MySQLDatabase)
 	}
 	tokenManager, err := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTExpiresIn)
 	if err != nil {

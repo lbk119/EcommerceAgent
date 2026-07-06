@@ -15,6 +15,7 @@ kaggle.json
 output/
 updated/
 data/memory/
+data/gateway_users*.json
 
 # Downloaded datasets and generated demo data
 data/olist/*.zip

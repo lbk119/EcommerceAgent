@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 
 from api.db import execute, execute_many, fetch_all, fetch_one, ensure_platform_schema, mysql_conn
@@ -58,7 +59,7 @@ def ensure_shop_seed(tenant_id: str, shop_id: str | None) -> str:
     execute(
         """
         INSERT INTO gateway_shops (tenant_id, id, name, category, platform, shop_type, business_stage, status, auth_status, data_status, last_sync_at)
-        VALUES (%s, %s, '示例旗舰店', '服饰鞋包', '淘宝 / 天猫', '品牌自营', '成长期', 'active', 'authorized', 'sample', NOW())
+        VALUES (%s, %s, 'Demo Flagship Store', 'apparel', 'taobao_tmall', 'brand_owned', 'growth', 'active', 'authorized', 'sample', NOW())
         ON DUPLICATE KEY UPDATE updated_at=NOW()
         """,
         (tenant_id, fallback_shop_id),
@@ -89,11 +90,11 @@ def list_shops(tenant_id: str) -> list[dict[str, Any]]:
         {
             "id": row["id"],
             "name": row["name"],
-            "category": row.get("category") or "未设置",
-            "platform": row.get("platform") or "淘宝 / 天猫",
+            "category": row.get("category") or "unset",
+            "platform": row.get("platform") or "taobao_tmall",
             "status": row.get("status") or "active",
-            "type": row.get("shop_type") or "品牌自营",
-            "businessStage": row.get("business_stage") or "成长期",
+            "type": row.get("shop_type") or "brand_owned",
+            "businessStage": row.get("business_stage") or "growth",
             "authStatus": row.get("auth_status") or "pending",
             "importStatus": row.get("data_status") or "empty",
             "lastSyncAt": normalize_time(row.get("last_sync_at")),
@@ -105,7 +106,7 @@ def list_shops(tenant_id: str) -> list[dict[str, Any]]:
 def create_shop(tenant_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """创建店铺元数据；经营数据不会被这里写入或删除。"""
     ensure_platform_schema()
-    shop_name = payload.get("name") or "未命名店铺"
+    shop_name = payload.get("name") or "New Shop"
     if payload.get("reuseByName") and not payload.get("id"):
         existing = fetch_one(
             """
@@ -126,7 +127,7 @@ def create_shop(tenant_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', 'pending', 'empty', NULL)
         ON DUPLICATE KEY UPDATE name=VALUES(name), category=VALUES(category), platform=VALUES(platform), shop_type=VALUES(shop_type), business_stage=VALUES(business_stage), status='active'
         """,
-        (tenant_id, shop_id, shop_name, payload.get("category") or "未设置", payload.get("platform") or "淘宝 / 天猫", payload.get("type") or payload.get("shopType") or "品牌自营", payload.get("businessStage") or "成长期"),
+        (tenant_id, shop_id, shop_name, payload.get("category") or "unset", payload.get("platform") or "taobao_tmall", payload.get("type") or payload.get("shopType") or "brand_owned", payload.get("businessStage") or "growth"),
     )
     return get_shop(tenant_id, shop_id)
 
@@ -317,7 +318,7 @@ def list_products(tenant_id: str, shop_id: str, filters: dict[str, Any] | None =
     positive_sales = [int(row.get("sales") or 0) for row in rows if int(row.get("sales") or 0) > 0]
     hot_threshold_index = max(0, int(len(positive_sales) * 0.2) - 1)
     hot_threshold = sorted(positive_sales, reverse=True)[hot_threshold_index] if positive_sales else 0
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         stock = int(row.get("stock") or 0)
         safety_stock = int(row.get("safety_stock") or 0)
         sales = int(row.get("sales") or 0)
@@ -336,15 +337,17 @@ def list_products(tenant_id: str, shop_id: str, filters: dict[str, Any] | None =
         products.append({
             "id": row["id"],
             "name": row.get("product_name") or row["id"],
-            "sku": row["id"],
+            "sku": display_sku(row["id"], row.get("category"), index),
             "category": row["category"],
             "price": float(row.get("price") or 0),
             "stock": stock,
+            "safetyStock": safety_stock,
             "sales": sales,
             "conversionRate": round(float(row.get("conversion_rate") or 0), 2),
             "riskLevel": risk_level,
             "layer": layer,
             "riskReason": risk_reason,
+            "suggestedAction": _product_suggestion(risk_level, layer),
             "aiSuggestion": _product_suggestion(risk_level, layer),
         })
     keyword = (filters.get("keyword") or "").lower()
@@ -381,7 +384,7 @@ def list_inventory_risks(tenant_id: str, shop_id: str) -> list[dict[str, Any]]:
         (tenant_id, shop_id, tenant_id, shop_id, tenant_id, shop_id),
     )
     risks = []
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         stock = int(row.get("stock") or 0)
         safety_stock = int(row.get("safety_stock") or 0)
         sales7d = int(row.get("sales7d") or 0)
@@ -396,7 +399,7 @@ def list_inventory_risks(tenant_id: str, shop_id: str) -> list[dict[str, Any]]:
             suggested_action = "降低补货优先级，复盘价格和流量入口"
         else:
             continue
-        risks.append({"sku": row["sku"], "productName": row["product_name"], "stock": stock, "safetyStock": safety_stock, "sales7d": sales7d, "turnoverDays": turnover_days, "riskLevel": risk_level, "riskReason": risk_reason, "suggestedAction": suggested_action})
+        risks.append({"sku": display_sku(row["sku"], None, index), "productName": row["product_name"], "name": row["product_name"], "stock": stock, "safetyStock": safety_stock, "sales7d": sales7d, "turnoverDays": turnover_days, "riskLevel": risk_level, "riskReason": risk_reason, "suggestedAction": suggested_action})
     return risks
 
 
@@ -478,6 +481,41 @@ def _product_suggestion(risk_level: str, layer: str) -> str:
     return "建议维持日常监控，观察转化率和库存周转是否出现异常。"
 
 
+def display_sku(product_id: str, category: str | None = None, index: int = 0) -> str:
+    """把内部 product_id 统一转换成短、稳定、可读的展示 SKU。
+
+    经营表为了避免多租户/多店铺主键冲突，会把 tenant/shop/UUID 前缀写入 product_id。旧数据里还
+    可能混入 Windows/终端编码造成的 mojibake，例如 `__åº__..._gift_004`。这些值只能作为内部主键，
+    绝不能直接展示给用户；这里根据已知样例后缀、商品类目和稳定 hash 生成业务侧 SKU。
+    """
+    value = str(product_id or "")
+    category_value = str(category or "").lower()
+    sample_map = {
+        "orange_001": "ORANGE-FRESH-001",
+        "orange_002": "ORANGE-FAMILY-002",
+        "juice_003": "JUICE-NFC-003",
+        "gift_004": "ORANGE-GIFT-004",
+        "orange_005": "ORANGE-TRIAL-005",
+        "jam_006": "JAM-ORANGE-006",
+    }
+    for suffix, display in sample_map.items():
+        if value.endswith(suffix):
+            return display
+    if "gift" in category_value or "gift" in value.lower():
+        prefix = "ORANGE-GIFT"
+    elif "juice" in category_value or "juice" in value.lower():
+        prefix = "JUICE-NFC"
+    elif "jam" in category_value or "jam" in value.lower():
+        prefix = "JAM-ORANGE"
+    elif "fresh_orange" in category_value or "orange" in value.lower():
+        prefix = "ORANGE-FRESH"
+    else:
+        prefix = "SKU"
+    stable_number = uuid.uuid5(uuid.NAMESPACE_URL, value or str(index)).int % 1000
+    suffix = f"{stable_number or index or 1:03d}"[-3:]
+    return f"{prefix}-{suffix}"[:32]
+
+
 def _campaign_conclusion(roi: float, gmv: float, risk_skus: int, refund_count: int) -> str:
     """根据活动 ROI、成交、库存和退款风险生成复盘结论。"""
     if risk_skus > 0:
@@ -518,15 +556,31 @@ def _job_status_cn(status: str) -> str:
 def workspace_bundle(tenant_id: str, shop_id: str | None) -> dict[str, Any]:
     actual_shop_id = ensure_shop_seed(tenant_id, shop_id)
     ensure_integrations(tenant_id, actual_shop_id)
+    warnings: list[str] = []
+
+    def timed(name: str, factory, fallback):
+        start = perf_counter()
+        try:
+            value = factory()
+            elapsed_ms = round((perf_counter() - start) * 1000, 1)
+            print(f"[workspace] tenant={tenant_id} shop={actual_shop_id} module={name} elapsed_ms={elapsed_ms}")
+            return value
+        except Exception as error:
+            elapsed_ms = round((perf_counter() - start) * 1000, 1)
+            print(f"[workspace] tenant={tenant_id} shop={actual_shop_id} module={name} failed elapsed_ms={elapsed_ms} error={error}")
+            warnings.append(f"{name} 加载失败")
+            return fallback
+
     return {
         "currentShopId": actual_shop_id,
-        "shops": list_shops(tenant_id),
-        "integrations": list_integrations(tenant_id, actual_shop_id),
-        "metrics": get_metrics(tenant_id, actual_shop_id),
-        "products": list_products(tenant_id, actual_shop_id),
-        "agents": list_agents(tenant_id, actual_shop_id),
-        "reports": list_reports(tenant_id, actual_shop_id),
-        "strategies": list_strategies(tenant_id, actual_shop_id),
-        "campaigns": list_campaigns(tenant_id, actual_shop_id),
-        "imports": list_import_jobs(tenant_id, actual_shop_id),
+        "shops": timed("shops", lambda: list_shops(tenant_id), []),
+        "integrations": timed("integrations", lambda: list_integrations(tenant_id, actual_shop_id), []),
+        "metrics": timed("metrics", lambda: get_metrics(tenant_id, actual_shop_id), {"date": datetime.now().strftime("%Y-%m-%d"), "gmv": 0, "orders": 0, "conversionRate": 0, "averageOrderValue": 0, "refundRate": 0, "visitors": 0, "inventoryRiskSkuCount": 0, "activeCampaignProducts": 0, "aiCompletedTasks": 0}),
+        "products": timed("products", lambda: list_products(tenant_id, actual_shop_id), []),
+        "agents": timed("agents", lambda: list_agents(tenant_id, actual_shop_id), []),
+        "reports": timed("reports", lambda: list_reports(tenant_id, actual_shop_id), []),
+        "strategies": timed("strategies", lambda: list_strategies(tenant_id, actual_shop_id), []),
+        "campaigns": timed("campaigns", lambda: list_campaigns(tenant_id, actual_shop_id), []),
+        "imports": timed("imports", lambda: list_import_jobs(tenant_id, actual_shop_id), []),
+        "warnings": warnings,
     }

@@ -13,6 +13,7 @@
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Optional, Sequence
 
@@ -67,18 +68,25 @@ async def run_critic_stage(
     return CriticStageResult(content=content, critic_status=critic_status)
 
 
-def persist_result(context: TaskRunContext, final_result: str) -> dict:
+def persist_result(context: TaskRunContext, final_result: str, *, runtime_profile: str = "deep") -> dict:
     """
     结果持久化阶段。
 
     这里写 task_events、reflection 和 policy proposal。它不写长期记忆，也不结束 trace，保持每个
     阶段的副作用单一，后续接 DAG 时可以复用同一套落盘逻辑。
     """
+    started_at = time.perf_counter()
+    tracer.emit("persistence_started", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="result_pipeline", metadata={"stage": "persistence", "status": "running"})
     safe_result = redact_secrets(final_result)
-    reflection = build_task_reflection(context.query, result=safe_result)
     append_task_event("task_completed", context.task_id, {"result": safe_result, "conversation_id": context.conversation_id})
-    append_reflection(context.task_id, context.query, reflection["status"], reflection["summary"], reflection["lessons"])
-    create_policy_proposal(context.task_id, context.query, reflection)
+    if runtime_profile == "deep":
+        reflection = build_task_reflection(context.query, result=safe_result)
+        append_reflection(context.task_id, context.query, reflection["status"], reflection["summary"], reflection["lessons"])
+        create_policy_proposal(context.task_id, context.query, reflection)
+    else:
+        reflection = {"status": "deferred", "summary": "reflection and policy proposal moved out of hot path", "lessons": []}
+        tracer.emit("result_enrichment_deferred", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="result_pipeline", metadata={"runtime_profile": runtime_profile, "deferred": ["reflection", "policy_proposal"]})
+    tracer.emit("persistence_finished", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="result_pipeline", latency_ms=round((time.perf_counter() - started_at) * 1000, 2), metadata={"stage": "persistence", "status": "completed"})
     return reflection
 
 
@@ -89,11 +97,14 @@ def write_memory(context: TaskRunContext, final_result: str, reflection: dict, e
     Store/Milvus 不应该保存密钥、token 或连接串，所以进入 memory writer 前先做脱敏。脱敏只影响
     持久化内容，不改用户最终看到的回答。
     """
+    started_at = time.perf_counter()
+    tracer.emit("memory_write_started", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="memory_writer", metadata={"stage": "memory_write", "status": "running"})
     safe_result = redact_secrets(final_result)
     execution_metadata = execution_metadata or {}
     memory_write_result = write_memories_after_task(context.identity, context.query, safe_result, reflection.get("lessons", []), execution_metadata=execution_metadata)
     memory_event_metadata = {"conversation_id": context.conversation_id, **memory_write_result, "execution_metadata": execution_metadata}
     append_task_event("memory_write_completed", context.task_id, memory_event_metadata)
+    tracer.emit("memory_write_finished", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="memory_writer", latency_ms=round((time.perf_counter() - started_at) * 1000, 2), metadata={"stage": "memory_write", "status": "completed", **memory_event_metadata})
     tracer.emit("memory_written", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="main_agent", metadata=memory_event_metadata)
     return memory_write_result
 
@@ -153,6 +164,7 @@ async def _apply_critic_if_needed(
     Critic -> Agent -> Critic 的无限循环。
     """
     if not _critic_enabled() or not final_result:
+        tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "disabled_or_empty"})
         return final_result, "skipped"
 
     policy_decision = evaluate_critic_policy(
@@ -170,6 +182,7 @@ async def _apply_critic_if_needed(
         metadata=policy_decision.to_metadata(),
     )
     if not policy_decision.required:
+        tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "policy_not_required"})
         return final_result, "skipped"
 
     critic_result = await run_critic(context.query, final_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)

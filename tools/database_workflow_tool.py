@@ -347,9 +347,9 @@ def _summarize_node(state: DatabaseGraphState) -> DatabaseGraphState:
         return {**state, "final_answer": _summarize_top_products(result), "route": "end"}
 
     try:
-        from agent.llm import get_reasoning_model
+        from agent.llm import get_standard_model
 
-        response = get_reasoning_model().invoke(f"""
+        response = get_standard_model().invoke(f"""
 你是电商数据库分析助手。请基于数据库查询结果回答用户问题，禁止编造结果中不存在的指标。
 
 用户问题：{question}
@@ -499,9 +499,9 @@ def _generate_sql(state):
     # 通用查询仍由 LLM 生成 SQL，但状态机只允许有限次数失败和重复方案检测。
     previous_errors = "\n".join(state.get("errors", [])[-3:]) or "无"
     previous_sql = "\n".join(state.get("sql_history", [])[-3:]) or "无"
-    from agent.llm import get_reasoning_model
+    from agent.llm import get_standard_model
 
-    response = get_reasoning_model().invoke(f"""
+    response = get_standard_model().invoke(f"""
 你是 MySQL 只读 SQL 生成器。只返回一条 SQL，不要 Markdown，不要解释。
 
 硬性规则：
@@ -527,9 +527,9 @@ def _generate_sql(state):
 
 def _generate_write_sql(question):
     # 写操作只生成候选 SQL，不会在生成阶段执行；后续必须经过 sandbox 和人工审核。
-    from agent.llm import get_reasoning_model
+    from agent.llm import get_standard_model
 
-    response = get_reasoning_model().invoke(f"""
+    response = get_standard_model().invoke(f"""
 你是 MySQL 数据库变更 SQL 生成器。只返回一条 SQL，不要 Markdown，不要解释。
 
 安全规则：

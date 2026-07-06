@@ -154,7 +154,7 @@ class _LocalBGEWorker:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("TOKENIZERS_PARALLELISM", "false")
         self._process = subprocess.Popen(
-            [sys.executable, "-m", "agent.memory.bge_worker"],
+            [sys.executable, "-m", "agent_extensions.semantic_memory.bge_worker"],
             cwd=str(PROJECT_ROOT),
             env=env,
             stdin=subprocess.PIPE,

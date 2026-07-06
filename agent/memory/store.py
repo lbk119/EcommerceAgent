@@ -15,7 +15,7 @@ from agent.memory.schema import (
 from agent.core.db import get_db_config
 
 try:
-    from agent.memory.milvus_store import index_memory_embedding
+    from agent_extensions.semantic_memory.milvus_store import index_memory_embedding
 except Exception:
     index_memory_embedding = None
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 
-TASK_TYPES = {"daily_report", "inventory_analysis", "campaign_review", "refund_analysis", "hot_product_analysis", "general_chat"}
+TASK_TYPES = {"seasonal_selection", "product_optimization", "inventory_analysis", "campaign_review", "daily_report", "hot_product_analysis", "refund_analysis", "general_business_chat"}
 RISK_LEVELS = {"low", "medium", "high"}
 WORKFLOWS = {"deepagent", "deterministic_dag"}
 
@@ -46,6 +46,10 @@ def classify_task(query: str) -> TaskClassification:
     执行失败时再回落 DeepAgent。
     """
     compact_query = _compact(query)
+    if _contains_any(compact_query, _SEASONAL_SELECTION_KEYWORDS):
+        return TaskClassification("seasonal_selection", "medium", True, "deterministic_dag")
+    if _contains_any(compact_query, _PRODUCT_OPTIMIZATION_KEYWORDS):
+        return TaskClassification("product_optimization", "medium", True, "deterministic_dag")
     if _contains_any(compact_query, _HOT_PRODUCT_KEYWORDS):
         return TaskClassification("hot_product_analysis", "medium", True, "deterministic_dag")
 
@@ -62,9 +66,9 @@ def classify_task(query: str) -> TaskClassification:
 
     # SQL、写库、更新等词即使没有匹配到具体业务模板，也应提升风险并要求 Critic。
     if _contains_any(compact_query, ("sql", "写入", "更新", "插入", "删除", "改库", "入库")):
-        return TaskClassification("general_chat", "high", True, "deepagent")
+        return TaskClassification("general_business_chat", "high", True, "deepagent")
 
-    return TaskClassification("general_chat", "low", False, "deepagent")
+    return TaskClassification("general_business_chat", "low", False, "deepagent")
 
 
 def _first_matching_type(compact_query: str) -> str:
@@ -87,6 +91,36 @@ _TASK_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("inventory_analysis", ("库存", "补货", "安全库存", "缺货", "滞销", "inventory")),
     ("campaign_review", ("活动复盘", "投放复盘", "roi", "转化率", "campaign")),
     ("refund_analysis", ("退款", "退款率", "客诉", "异常分析", "refund")),
+)
+
+
+_SEASONAL_SELECTION_KEYWORDS: Tuple[str, ...] = (
+    "这个季节适合卖什么",
+    "现在适合卖什么",
+    "夏天卖什么",
+    "冬天卖什么",
+    "春天卖什么",
+    "秋天卖什么",
+    "应季商品",
+    "季节性",
+    "选品",
+    "上新",
+    "趋势",
+    "市场机会",
+    "适合卖什么东西",
+)
+
+
+_PRODUCT_OPTIMIZATION_KEYWORDS: Tuple[str, ...] = (
+    "哪个商品值得优化",
+    "哪个商品最值得优化",
+    "商品怎么优化",
+    "商品优化",
+    "标题",
+    "主图",
+    "价格",
+    "转化",
+    "转化率",
 )
 
 

@@ -1,5 +1,6 @@
 import datetime
 import asyncio
+import os
 from typing import Any, Dict, Optional
 from fastapi import WebSocket
 from api.context import get_thread_context
@@ -41,20 +42,40 @@ class ToolMonitor:
 
     def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None, thread_id: Optional[str] = None):
         """内部发送方法"""
+        event_data = data or {}
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+        target_thread_id = thread_id or get_thread_context()
+        stage = event_data.get("stage") or _stage_for_event(event_type)
+        status = event_data.get("status") or _status_for_event(event_type)
+        display = _display_for_event(event_type, stage, event_data)
         payload = {
-            "type": "monitor_event",
+            # 商业化前端使用 agent_progress 协议渲染阶段卡片；下面的 event/data 等旧字段保留给脚本模式和历史页面兼容。
+            "type": "agent_progress",
+            "legacy_type": "monitor_event",
             "event": event_type,
+            "event_type": event_type,
+            "eventType": event_type,
             "message": message,
-            "data": data or {},
-            "timestamp": datetime.datetime.now().isoformat()
+            "title": display["title"],
+            "detail": display["detail"],
+            "task_id": event_data.get("task_id"),
+            "taskId": event_data.get("task_id"),
+            "messageId": event_data.get("message_id"),
+            "conversation_id": event_data.get("conversation_id") or target_thread_id,
+            "conversationId": event_data.get("conversation_id") or target_thread_id,
+            "stage": stage,
+            "status": status,
+            "latency_ms": event_data.get("latency_ms"),
+            "latencyMs": event_data.get("latency_ms"),
+            "metadata": event_data,
+            "data": event_data,
+            "display": display,
+            "timestamp": timestamp,
         }
 
         # 1. 优先尝试通过 FastAPI WebSocket 发送 (定向推送)
         if self.websocket_manager:
             try:
-                # 获取当前线程 ID
-                target_thread_id = thread_id or get_thread_context()
-
                 # 确保 loop 已加载 [fastapi的事件循环]
                 manager_loop = self.websocket_manager.loop
 
@@ -64,7 +85,6 @@ class ToolMonitor:
                         try:
                             # 当前的循环事件
                             current_loop = asyncio.get_running_loop()
-                            print(f"对比是不是同一个event_loop:{manager_loop == current_loop}")
                         except RuntimeError:
                             current_loop = None
 
@@ -96,9 +116,9 @@ class ToolMonitor:
             except Exception:
                 pass
 
-        # 3. 控制台保底输出 (方便调试)
-        # 加上特殊前缀，方便肉眼识别
-        print(f"\n[Monitor:{event_type}] {message}")
+        # 3. 控制台保底输出默认关闭；Windows 控制台同步 print 会拖慢 realtime 热路径。
+        if os.getenv("MONITOR_CONSOLE_LOG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+            print(f"\n[Monitor:{event_type}] {message}")
 
     def report_tool(self, tool_name: str, args: Dict[str, Any] = None):
         """报告工具开始执行"""
@@ -117,9 +137,144 @@ class ToolMonitor:
         """报告任务工作目录"""
         self._emit("session_created", f"工作目录已创建: {path}", {"path": path})
 
+    def emit_assistant_delta(self, *, task_id: str, conversation_id: str, message_id: str, delta: str):
+        """推送 assistant 增量文本；模型暂不支持真 token streaming 时，也可用于 deterministic draft 的分段输出。"""
+        self._send_chat_event({
+            "type": "assistant_delta",
+            "taskId": task_id,
+            "task_id": task_id,
+            "messageId": message_id,
+            "message_id": message_id,
+            "conversationId": conversation_id,
+            "conversation_id": conversation_id,
+            "delta": delta,
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }, conversation_id)
+
+    def emit_assistant_final(self, *, task_id: str, conversation_id: str, message_id: str, content: str, source: str, total_latency_ms: float | None = None):
+        """推送最终答案，前端收到后可立即完成占位消息，不必等待下一次轮询。"""
+        self._send_chat_event({
+            "type": "assistant_final",
+            "taskId": task_id,
+            "task_id": task_id,
+            "messageId": message_id,
+            "message_id": message_id,
+            "conversationId": conversation_id,
+            "conversation_id": conversation_id,
+            "content": content,
+            "assistantContent": content,
+            "assistant_content": content,
+            "source": source,
+            "totalLatencyMs": total_latency_ms,
+            "total_latency_ms": total_latency_ms,
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }, conversation_id)
+
+    def emit_agent_error(self, *, task_id: str, conversation_id: str, message_id: str, error_message: str, recoverable: bool = True):
+        """推送真实失败原因，禁止前端把失败伪装成成功回答。"""
+        self._send_chat_event({
+            "type": "agent_error",
+            "taskId": task_id,
+            "task_id": task_id,
+            "messageId": message_id,
+            "message_id": message_id,
+            "conversationId": conversation_id,
+            "conversation_id": conversation_id,
+            "errorMessage": error_message,
+            "error_message": error_message,
+            "recoverable": recoverable,
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }, conversation_id)
+
+    def _send_chat_event(self, payload: Dict[str, Any], thread_id: str):
+        if not self.websocket_manager or not self.websocket_manager.loop:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.websocket_manager.send_to_thread(payload, thread_id), self.websocket_manager.loop)
+        except Exception as e:
+            print(f"[Monitor] chat event send failed: {e}")
+
 
 # 全局单例实例
 monitor = ToolMonitor()
+
+
+def _stage_for_event(event_type: str) -> str:
+    if event_type.startswith("prompt_guard"):
+        return "prompt_guard"
+    if event_type == "task_classified":
+        return "task_classified"
+    if event_type in {"context_prepared", "memory_retrieval_started", "memory_retrieval_finished", "memory_retrieved"}:
+        return "context_prepared" if event_type == "context_prepared" else "memory"
+    if event_type.startswith("workflow"):
+        return "workflow"
+    if event_type.startswith("tool_call"):
+        return "tool"
+    if event_type.startswith("llm_call"):
+        return "llm"
+    if event_type.startswith("critic"):
+        return "critic"
+    if event_type.startswith("persistence"):
+        return "persistence"
+    if event_type.startswith("memory_write") or event_type == "memory_written":
+        return "memory_write"
+    if event_type == "agent_finished":
+        return "agent_finished"
+    if event_type == "agent_failed":
+        return "agent_failed"
+    return event_type
+
+
+def _status_for_event(event_type: str) -> str:
+    if event_type == "queued" or event_type.endswith("_started"):
+        return "running"
+    if event_type.endswith("_finished") or event_type in {"task_classified", "context_prepared", "memory_retrieved", "memory_written"}:
+        return "completed"
+    if event_type.endswith("_failed") or event_type == "agent_failed":
+        return "failed"
+    if event_type.endswith("_skipped"):
+        return "skipped"
+    if event_type == "agent_finished":
+        return "completed"
+    return "running"
+
+
+def _display_for_event(event_type: str, stage: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    title_map = {
+        "queued": ("接收问题", "Agent 已接收任务"),
+        "task_classified": ("识别意图", "已识别问题类型"),
+        "context_prepared": ("读取数据", "运行上下文已准备"),
+        "workflow_route_decided": ("命中工作流", "已选择快速 workflow" if data.get("workflow_name") else "未命中固定 workflow"),
+        "llm_call_started": ("生成建议", "正在生成建议"),
+        "llm_call_finished": ("生成建议", "建议生成完成"),
+        "critic_skipped": ("质量检查", "轻量模式跳过完整 Critic"),
+        "persistence_finished": ("写入结果", "结果已写入"),
+        "memory_write_skipped": ("写入结果", "记忆写入后台处理"),
+        "agent_finished": ("完成", "分析完成"),
+    }
+    group, title = title_map.get(event_type, (_group_for_stage(stage), str(event_type)))
+    if event_type.startswith("workflow_step"):
+        group = "读取数据"
+        title = f"{data.get('step_name') or '业务数据'}{'已读取' if event_type.endswith('finished') else '读取中'}"
+    return {
+        "group": group,
+        "importance": "high" if event_type in {"queued", "task_classified", "workflow_route_decided", "llm_call_finished", "agent_finished"} else "normal",
+        "collapsible": True,
+        "title": title,
+        "detail": data.get("detail") or data.get("result_preview") or "",
+    }
+
+
+def _group_for_stage(stage: str) -> str:
+    if stage in {"workflow", "context_prepared", "memory"}:
+        return "读取数据"
+    if stage == "llm":
+        return "生成建议"
+    if stage == "critic":
+        return "质量检查"
+    if stage in {"persistence", "memory_write"}:
+        return "写入结果"
+    return "执行过程"
 
 
 class ConnectionManager:
@@ -152,6 +307,13 @@ class ConnectionManager:
         if thread_id in self.active_connections:
             websocket = self.active_connections[thread_id]
             await websocket.send_json(message)
+
+    def stats(self) -> dict:
+        """返回 WebSocket 连接状态，避免健康检查把未连接的进度通道误报为 ok。"""
+        return {
+            "websocketManager": "ok" if self.loop else "not_started",
+            "activeConnections": len(self.active_connections),
+        }
 
 
 manager = ConnectionManager()

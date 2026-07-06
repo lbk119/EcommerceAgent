@@ -182,6 +182,26 @@ async def create_upload_job(tenant_id: str, shop_id: str, user_id: str, file: Up
     return {"id": job_id, "fileName": safe_name, "status": "mapping_required"}
 
 
+def create_paste_job(tenant_id: str, shop_id: str, user_id: str, text: str) -> dict[str, Any]:
+    """保存粘贴的 CSV/TSV 文本并创建导入 job，后续复用 preview/confirm。"""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("粘贴内容为空")
+    job_id = str(uuid.uuid4())
+    safe_name = "paste_import.tsv" if "\t" in cleaned.splitlines()[0] else "paste_import.csv"
+    target = IMPORT_DIR / f"{job_id}_{safe_name}"
+    target.write_text(cleaned + "\n", encoding="utf-8-sig")
+    preview_rows = _read_upload_rows(target, limit=20)
+    execute(
+        """
+        INSERT INTO data_import_jobs (id, tenant_id, shop_id, source, file_name, status, rows_count, quality_score, created_by)
+        VALUES (%s, %s, %s, 'paste', %s, 'mapping_required', %s, %s, %s)
+        """,
+        (job_id, tenant_id, shop_id, safe_name, len(preview_rows), 88 if preview_rows else 0, user_id),
+    )
+    return {"id": job_id, "fileName": safe_name, "status": "mapping_required"}
+
+
 def preview_job(tenant_id: str, shop_id: str, job_id: str) -> dict[str, Any]:
     """返回上传文件前 20 行和简单字段识别结果。"""
     row = fetch_one("SELECT file_name FROM data_import_jobs WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, job_id))
@@ -257,7 +277,7 @@ def import_uploaded_csv_data(tenant_id: str, shop_id: str, file_path: Path) -> i
         quantity = max(1, _int(row.get("quantity"), 1))
         pay_amount = _float(row.get("pay_amount"), unit_price * quantity)
         campaign_name = row.get("campaign_name") or "CSV 上传活动"
-        campaign_id = f"{prefix}_campaign_{_safe_id(campaign_name, 'csv')}"
+        campaign_id = f"{prefix}_campaign_{_safe_id(campaign_name, 'csv')}"[:64]
 
         customers[customer_id] = (tenant_id, shop_id, customer_id, f"{customer_id}_unique", 330000 + (index % 9000), row.get("customer_city") or "未知城市", "未知")
         products[product_id] = (tenant_id, shop_id, product_id, row.get("product_name") or product_id, row.get("category") or "uploaded", len(row.get("product_name") or product_id))
@@ -380,7 +400,10 @@ def _read_upload_rows(file_path: Path, limit: int | None = None) -> list[dict[st
         workbook.close()
         return rows
     with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
+        sample = handle.read(4096)
+        handle.seek(0)
+        delimiter = "\t" if "\t" in sample.splitlines()[0] and "," not in sample.splitlines()[0] else ","
+        reader = csv.DictReader(handle, delimiter=delimiter)
         rows = []
         for index, item in enumerate(reader):
             if limit is not None and index >= limit:

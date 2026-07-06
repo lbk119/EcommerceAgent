@@ -4,7 +4,6 @@ from fastapi import APIRouter, Request
 
 from api.routes.helpers import gateway_identity
 from api.services.ecommerce_queries import AGENT_DEFINITIONS, create_shop, ensure_integrations, list_integrations, list_shops
-from api.services.import_service import create_sample_job
 
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
@@ -12,19 +11,17 @@ router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
 
 @router.post("/complete")
 async def complete_onboarding(payload: dict, request: Request):
-    """完成店铺、平台授权、示例数据和工作区初始化。"""
+    """完成店铺和平台初始化，重型数据导入由前端进入工作台后后台触发。"""
     identity = gateway_identity(request)
     shop = create_shop(identity["tenant_id"], {
         "name": payload.get("shopName"),
         "category": payload.get("category"),
-        "platform": "、".join(payload.get("selectedPlatforms") or ["淘宝 / 天猫"]),
+        "platform": ",".join(payload.get("selectedPlatforms") or ["taobao_tmall"]),
         "type": payload.get("shopType"),
         "businessStage": payload.get("businessStage"),
         "reuseByName": True,
     })
     ensure_integrations(identity["tenant_id"], shop["id"], payload.get("selectedPlatforms") or [])
-    if payload.get("dataMode") == "sample":
-        create_sample_job(identity["tenant_id"], shop["id"], identity["user_id"])
     # 完成引导是强交互动作，不能同步等待完整经营聚合；前端进入 dashboard 后会后台刷新 workspace。
     return {
         "onboardingCompleted": True,

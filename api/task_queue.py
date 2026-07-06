@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Awaitable, Callable, Dict
 
+from agent.runtime.profiles import normalize_runtime_profile
+
 
 TaskHandler = Callable[[dict], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -15,15 +17,22 @@ class TaskQueue:
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
         self.queue_name = os.getenv("TASK_QUEUE_NAME", "deepagent.tasks")
-        self.max_concurrency = max(1, int(os.getenv("MAX_AGENT_CONCURRENCY", "2")))
+        self.max_concurrency = max(1, int(os.getenv("MAX_AGENT_CONCURRENCY", "10")))
+        self.profile_concurrency = {
+            "realtime": max(1, int(os.getenv("REALTIME_AGENT_CONCURRENCY", "8"))),
+            "standard": max(1, int(os.getenv("STANDARD_AGENT_CONCURRENCY", "2"))),
+            "deep": max(1, int(os.getenv("DEEP_AGENT_CONCURRENCY", "1"))),
+        }
         self._inline_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._profile_semaphores: dict[str, asyncio.Semaphore] = {}
         self._running_tasks: set[asyncio.Task] = set()
 
     async def start(self, handler: TaskHandler) -> None:
         # Semaphore 绑定当前事件循环；服务启动时创建，避免模块导入阶段触碰 event loop。
         self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        self._profile_semaphores = {profile: asyncio.Semaphore(limit) for profile, limit in self.profile_concurrency.items()}
         if self.backend == "inline":
             self._worker_task = asyncio.create_task(self._inline_worker(handler))
             return
@@ -102,6 +111,18 @@ class TaskQueue:
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
+    def stats(self) -> dict:
+        """返回任务队列的真实运行状态，供 /agent-runtime/health 展示。"""
+        queued = self._inline_queue.qsize() if self.backend == "inline" else None
+        return {
+            "status": "ok" if self._worker_task and not self._worker_task.done() else "not_started",
+            "backend": self.backend,
+            "running": len(self._running_tasks),
+            "queued": queued,
+            "maxConcurrency": self.max_concurrency,
+            "profileConcurrency": self.profile_concurrency,
+        }
+
     async def _run_handler_safely(self, handler: TaskHandler, payload: dict) -> None:
         """
         在 MAX_AGENT_CONCURRENCY 限制下执行任务 handler。
@@ -114,7 +135,13 @@ class TaskQueue:
             semaphore = asyncio.Semaphore(self.max_concurrency)
             self._semaphore = semaphore
 
-        async with semaphore:
+        profile = self._profile_for_payload(payload)
+        profile_semaphore = self._profile_semaphores.get(profile)
+        if profile_semaphore is None:
+            profile_semaphore = asyncio.Semaphore(self.profile_concurrency.get(profile, 1))
+            self._profile_semaphores[profile] = profile_semaphore
+
+        async with semaphore, profile_semaphore:
             task_id = payload.get("task_id") or payload.get("thread_id") or payload.get("conversation_id") or "unknown"
             try:
                 await handler(payload)
@@ -142,6 +169,11 @@ class TaskQueue:
             )
         except Exception:
             logger.exception("Failed to write task queue failure trace")
+
+    def _profile_for_payload(self, payload: dict) -> str:
+        if payload.get("source") == "ai_chat":
+            return "realtime"
+        return normalize_runtime_profile(payload.get("runtime_profile") or payload.get("profile") or "standard")
 
 
 task_queue = TaskQueue()

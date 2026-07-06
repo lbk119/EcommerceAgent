@@ -21,6 +21,8 @@ type AuthHandler struct {
 type LoginRequest struct {
 	Account  string `json:"account"`
 	Username string `json:"username"`
+	Email    string `json:"email"`
+	Phone    string `json:"phone"`
 	Password string `json:"password" binding:"required"`
 }
 
@@ -72,7 +74,11 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		gatewayerrors.Abort(c, http.StatusBadRequest, "INVALID_REQUEST", "两次输入的密码不一致", nil)
 		return
 	}
-	account := firstNonEmpty(request.Username, request.Account, request.Email)
+	account := firstNonEmpty(request.Email, request.Phone, request.Account, request.Username)
+	if strings.TrimSpace(firstNonEmpty(request.Email, request.Phone, request.Account, request.Username)) == "" {
+		gatewayerrors.Abort(c, http.StatusBadRequest, "INVALID_REQUEST", "请输入邮箱或手机号", nil)
+		return
+	}
 	tenantName := firstNonEmpty(request.TenantName, request.TenantNameCamel, request.CompanyName)
 
 	user, err := h.store.Register(auth.RegisterInput{
@@ -124,7 +130,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		gatewayerrors.Abort(c, http.StatusBadRequest, "INVALID_REQUEST", "请输入用户名和密码", nil)
 		return
 	}
-	account := firstNonEmpty(request.Account, request.Username)
+	account := firstNonEmpty(request.Account, request.Username, request.Email, request.Phone)
 	if strings.TrimSpace(account) == "" {
 		gatewayerrors.Abort(c, http.StatusBadRequest, "INVALID_REQUEST", "请输入账号和密码", nil)
 		return
@@ -132,7 +138,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	user, err := h.store.Authenticate(account, request.Password)
 	if err != nil {
-		gatewayerrors.Unauthorized(c, "UNAUTHORIZED", "用户名或密码错误")
+		gatewayerrors.Unauthorized(c, "INVALID_CREDENTIALS", "账号或密码错误")
 		return
 	}
 
@@ -234,7 +240,7 @@ func userPayload(user auth.User) gin.H {
 	if len(user.Roles) > 0 {
 		role = user.Roles[0]
 	}
-	companyName := firstNonEmpty(user.CompanyName, user.DefaultTenantID, "默认组织")
+	companyName := firstNonEmpty(user.CompanyName, user.DefaultTenantID, "Default Organization")
 	return gin.H{
 		"id":                   user.ID,
 		"name":                 user.Name,
@@ -243,9 +249,9 @@ func userPayload(user auth.User) gin.H {
 		"companyName":          companyName,
 		"company_name":         companyName,
 		"role":                 role,
-		"plan":                 firstNonEmpty(user.Plan, "团队版"),
-		"createdAt":            firstNonEmpty(user.CreatedAt, "刚刚"),
-		"created_at":           firstNonEmpty(user.CreatedAt, "刚刚"),
+		"plan":                 firstNonEmpty(user.Plan, "Team"),
+		"createdAt":            firstNonEmpty(user.CreatedAt, "now"),
+		"created_at":           firstNonEmpty(user.CreatedAt, "now"),
 		"onboardingCompleted":  user.OnboardingDone,
 		"onboarding_completed": user.OnboardingDone,
 		"tenantIds":            user.TenantIDs,
@@ -282,9 +288,14 @@ func (h *AuthHandler) ensureTenantAdminPolicy(user auth.User) {
 		{"/api/v1/campaigns/:campaign_id/review", "POST"},
 		{"/api/v1/onboarding/complete", "POST"},
 		{"/api/v1/ai-chat/messages", "POST"},
+		{"/api/v1/ai-chat/conversations", "GET"},
+		{"/api/v1/ai-chat/conversations/:conversation_id/messages", "GET"},
+		{"/api/v1/ai-chat/messages/:message_id", "GET"},
+		{"/api/v1/ai-chat/tasks/:task_id/timeline", "GET"},
+		{"/api/v1/ai-chat/tasks/:task_id/cancel", "POST"},
 		{"/api/v1/reports", "(GET|POST)"},
 		{"/api/v1/reports/*path", "(GET|POST|PUT|PATCH|DELETE)"},
-		{"/api/v1/agents", "GET"},
+		{"/api/v1/agents", "(GET|POST|PUT|PATCH|DELETE)"},
 		{"/api/v1/agents/*path", "(GET|POST|PUT|PATCH|DELETE)"},
 		{"/api/v1/agents/strategies/:strategy_id/defer", "POST"},
 		{"/api/v1/data-import/*path", "(GET|POST|PUT|PATCH|DELETE)"},
@@ -311,6 +322,10 @@ func (h *AuthHandler) ensureTenantAdminPolicy(user auth.User) {
 		{"/api/v1/traces/:task_id", "GET"},
 		{"/api/v1/traces/:task_id/timeline", "GET"},
 		{"/api/v1/metrics/agents", "GET"},
+		{"/api/v1/agent-runtime/health", "GET"},
+		{"/api/v1/agent-runtime/metrics", "GET"},
+		{"/api/v1/agent-runtime/slow-tasks", "GET"},
+		{"/api/v1/agent-runtime/tasks/:task_id/diagnosis", "GET"},
 		{"/api/v1/ws/:thread_id", "GET"},
 	}
 	for _, tenantID := range user.TenantIDs {
@@ -325,7 +340,9 @@ func (h *AuthHandler) ensureTenantAdminPolicy(user auth.User) {
 func registerErrorMessage(reason string) string {
 	switch reason {
 	case "user already exists":
-		return "用户已存在，请直接登录"
+		return "账号已存在，请直接登录"
+	case "account required":
+		return "请输入邮箱或手机号"
 	case "user id required":
 		return "请输入用户名"
 	case "password required":

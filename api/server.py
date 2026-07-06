@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 import uuid
 import uvicorn
 from pathlib import Path
@@ -17,6 +19,7 @@ project_root = current_dir.parent
 # 注意：agent.main_agent 会构建 DeepAgents 图并初始化模型，不能在 server 导入阶段加载。
 # start_agent_task / approve_policy 会在真正需要执行 Agent 或热重载策略时再懒加载它。
 from api.monitor import manager
+from api.db import ensure_platform_schema
 from api.task_queue import task_queue
 from api.task_runtime import task_runtime
 from agent.memory.retriever import retrieve_long_term_memories
@@ -24,7 +27,9 @@ from agent.memory.schema import MemoryIdentity
 from agent.memory.store import get_memory_store, init_memory_store
 from agent.core.tool_registry import tool_registry
 from agent.evolution.policy_review import approve_policy_proposal, list_policy_proposals, reject_policy_proposal
-from agent.observability.trace_reader import build_agent_metrics, build_task_timeline, list_task_traces
+from agent.observability.trace_reader import build_agent_metrics, build_slow_tasks, build_task_timeline, list_task_traces
+from agent.observability.tracer import tracer
+from agent.diagnostics.slow_task_analyzer import diagnose_task
 from api.routes import agents, ai_chat, campaigns, dashboard, data_import, integrations, inventory, onboarding, products, reports, shops, workspace
 
 app = FastAPI(title="DeepAgents API")
@@ -137,35 +142,76 @@ async def startup_event():
     """
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
+    ensure_platform_schema()
     init_memory_store()
     await task_queue.start(start_agent_task)
     print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
 
 
 async def start_agent_task(payload: dict):
-    from agent.main_agent import run_deep_agent
+    from api.monitor import monitor
+    from api.services.ai_chat_service import complete_chat_run, fail_chat_run
     from api.services.job_result_service import finalize_agent_job_failure, finalize_agent_job_success
+    from api.services.result_payload import result_markdown, structured_json
 
     conversation_id = payload["conversation_id"]
     task_id = payload["task_id"]
     if await task_runtime.is_cancelled(task_id):
         return
+    runtime_name = "ChatAgentRuntime" if payload.get("source") == "ai_chat" else "DeepAgentRuntime"
+    print(f"[{runtime_name}] Agent task started tenant={payload['tenant_id']} shop={payload['shop_id']} user={payload['user_id']} task={task_id}")
     metadata = {
         "conversation_id": conversation_id,
         "tenant_id": payload["tenant_id"],
         "user_id": payload["user_id"],
         "shop_id": payload["shop_id"],
+        "source": payload.get("source"),
+        "message_id": payload.get("message_id"),
+        "intent": payload.get("intent"),
+        "runtime_profile": payload.get("runtime_profile"),
     }
     async def run_and_finalize():
         try:
-            final_result = await run_deep_agent(
-                payload["query"],
-                conversation_id=conversation_id,
-                task_id=task_id,
-                tenant_id=payload["tenant_id"],
-                user_id=payload["user_id"],
-                shop_id=payload["shop_id"],
-            )
+            if payload.get("source") == "ai_chat":
+                from agent.chat_agent_runtime import run_chat_agent
+
+                # AI Chat 有独立最长运行时间，避免普通聊天无限占用队列；数字员工不走这个限制。
+                agent_call = run_chat_agent(payload)
+                final_result = await asyncio.wait_for(agent_call, timeout=int(payload.get("max_runtime_seconds") or os.getenv("AI_CHAT_MAX_RUNTIME_SECONDS", "180")))
+            else:
+                from agent.main_agent import run_deep_agent
+
+                agent_call = run_deep_agent(
+                    payload["query"],
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    tenant_id=payload["tenant_id"],
+                    user_id=payload["user_id"],
+                    shop_id=payload["shop_id"],
+                    runtime_profile=payload.get("runtime_profile") or "full",
+                )
+                final_result = await agent_call
+            final_markdown = result_markdown(final_result)
+            final_structured_json = structured_json(final_result)
+            if payload.get("source") == "ai_chat":
+                result_source = _ai_chat_result_source(payload)
+                complete_chat_run(
+                    tenant_id=payload["tenant_id"],
+                    shop_id=payload["shop_id"],
+                    user_id=payload["user_id"],
+                    task_id=task_id,
+                    assistant_content=final_markdown,
+                    source=result_source,
+                    structured_result_json=final_structured_json,
+                )
+                monitor.emit_assistant_final(
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    message_id=str(payload.get("message_id") or ""),
+                    content=final_markdown,
+                    source=result_source,
+                    total_latency_ms=round((time.time() - float(payload.get("accepted_at") or time.time())) * 1000, 2),
+                )
             await finalize_agent_job_success(
                 tenant_id=payload["tenant_id"],
                 shop_id=payload["shop_id"],
@@ -175,8 +221,30 @@ async def start_agent_task(payload: dict):
                 final_result=final_result,
                 execution_metadata=metadata,
             )
-            return final_result
+            return final_markdown
+        except asyncio.TimeoutError:
+            if payload.get("source") == "ai_chat":
+                timeout_message = "Agent 分析超过最长运行时间，已自动停止。请缩小问题范围后重新执行。"
+                fail_chat_run(
+                    tenant_id=payload["tenant_id"],
+                    shop_id=payload["shop_id"],
+                    user_id=payload["user_id"],
+                    task_id=task_id,
+                    error_message=timeout_message,
+                    status="timeout",
+                )
+                monitor.emit_agent_error(task_id=task_id, conversation_id=conversation_id, message_id=str(payload.get("message_id") or ""), error_message=timeout_message, recoverable=True)
+            raise
         except Exception as error:
+            if payload.get("source") == "ai_chat":
+                fail_chat_run(
+                    tenant_id=payload["tenant_id"],
+                    shop_id=payload["shop_id"],
+                    user_id=payload["user_id"],
+                    task_id=task_id,
+                    error_message=str(error),
+                )
+                monitor.emit_agent_error(task_id=task_id, conversation_id=conversation_id, message_id=str(payload.get("message_id") or ""), error_message=str(error), recoverable=True)
             await finalize_agent_job_failure(
                 tenant_id=payload["tenant_id"],
                 shop_id=payload["shop_id"],
@@ -194,6 +262,17 @@ async def start_agent_task(payload: dict):
         if hasattr(agent_coroutine, "close"):
             agent_coroutine.close()
         raise
+
+
+def _ai_chat_result_source(payload: dict) -> str:
+    """根据当前 intent 给前端一个可解释的结果来源标签。"""
+    intent = str(payload.get("intent") or "")
+    workflow_intents = {"seasonal_selection", "inventory_analysis", "campaign_review", "daily_report", "hot_product_analysis", "product_optimization"}
+    if intent in workflow_intents:
+        return "workflow_fast"
+    if intent in {"general_business_chat"}:
+        return "agent"
+    return "agent"
 
 
 @app.post("/api/task")
@@ -311,6 +390,70 @@ async def get_task_trace_timeline(task_id: str, http_request: Request):
 async def get_agent_metrics():
     """返回基于本地 JSONL trace 聚合的 Agent/工具指标。"""
     return build_agent_metrics()
+
+
+@app.get("/api/agent-runtime/health")
+async def get_agent_runtime_health(http_request: Request):
+    """返回 AgentRuntime 产品化健康状态。
+
+    这里故意区分 ok、disabled、not_connected：例如持续进化当前仍是 JSONL policy proposal，
+    不是 MySQL 工作流，所以不能伪装成完整商业化闭环已接入。
+    """
+    identity = trusted_identity(http_request, "default_tenant", "local_user", "default_shop")
+    memory_store_status = "ok"
+    pending_reviews = 0
+    try:
+        pending_reviews = len(get_memory_store().list_reviews(identity, status="pending", limit=200))
+    except Exception:
+        memory_store_status = "error"
+    vector_search_enabled = os.getenv("MEMORY_VECTOR_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    vector_write_enabled = os.getenv("MEMORY_VECTOR_WRITE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    pending_proposals = len([proposal for proposal in list_policy_proposals("pending")])
+    return {
+        "agentRuntime": "ok",
+        "taskQueue": task_queue.stats(),
+        "taskRuntime": await task_runtime.stats(),
+        "monitor": manager.stats(),
+        "tracer": {
+            "backend": os.getenv("AGENT_TRACE_PERSIST", "jsonl"),
+            "path": str(getattr(tracer, "path", "")),
+            "droppedCount": tracer.dropped_count,
+        },
+        "memory": {
+            "store": "mysql",
+            "enabled": memory_store_status == "ok",
+            "status": memory_store_status,
+            "vectorEnabled": vector_search_enabled or vector_write_enabled,
+            "vectorStatus": "ok" if vector_search_enabled or vector_write_enabled else "disabled",
+            "pendingReviews": pending_reviews,
+        },
+        "evolution": {
+            "policyProposalEnabled": True,
+            "status": "jsonl_not_mysql",
+            "pendingProposals": pending_proposals,
+        },
+    }
+
+
+@app.get("/api/agent-runtime/metrics")
+async def get_agent_runtime_metrics():
+    """返回 AgentRuntime 观测指标；当前基于 JSONL trace 聚合。"""
+    metrics = build_agent_metrics()
+    metrics["taskQueue"] = task_queue.stats()
+    metrics["taskRuntime"] = await task_runtime.stats()
+    return metrics
+
+
+@app.get("/api/agent-runtime/slow-tasks")
+async def get_agent_runtime_slow_tasks(limit: int = 20):
+    """返回最近慢任务，默认 20 条；数据来自 JSONL trace，不伪造数据库状态。"""
+    return build_slow_tasks(limit=max(1, min(limit, 100)))
+
+
+@app.get("/api/agent-runtime/tasks/{task_id}/diagnosis")
+async def get_agent_runtime_task_diagnosis(task_id: str):
+    """返回单个任务的慢因诊断：模型/工具/subagent/critic/memory/预算等维度。"""
+    return diagnose_task(task_id)
 
 
 @app.get("/api/memories/reviews")

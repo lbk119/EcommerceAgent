@@ -1,10 +1,10 @@
 """数据导入 API。"""
 
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from api.routes.helpers import gateway_identity, requested_shop
 from api.services.ecommerce_queries import list_import_jobs
-from api.services.import_service import confirm_job, create_sample_job, create_upload_job, preview_job, save_mapping
+from api.services.import_service import confirm_job, create_paste_job, create_sample_job, create_upload_job, preview_job, save_mapping
 
 
 router = APIRouter(prefix="/api/data-import", tags=["data-import"])
@@ -26,6 +26,16 @@ async def sample(request: Request):
 async def upload(request: Request, file: UploadFile = File(...)):
     identity = gateway_identity(request)
     return {"job": await create_upload_job(identity["tenant_id"], requested_shop(request, identity), identity["user_id"], file)}
+
+
+@router.post("/paste")
+async def paste(payload: dict, request: Request):
+    identity = gateway_identity(request)
+    try:
+        job = create_paste_job(identity["tenant_id"], requested_shop(request, identity), identity["user_id"], payload.get("text") or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"job": job}
 
 
 @router.get("/{job_id}/preview")
