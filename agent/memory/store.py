@@ -1,3 +1,9 @@
+"""MySQL 长期记忆存储。
+
+MySQL 是长期记忆的主存：保存已写入记忆和待审核候选。Milvus/向量库只是可选索引层，
+检索命中后仍回到 MySQL 按 tenant/user/shop 做权限过滤。
+"""
+
 import json
 from functools import lru_cache
 from typing import Any, Dict, List
@@ -17,18 +23,23 @@ from agent.core.db import get_db_config
 try:
     from agent_extensions.semantic_memory.milvus_store import index_memory_embedding
 except Exception:
+    # 向量索引是可选扩展；不可用时 MySQL LIKE 检索仍能工作。
     index_memory_embedding = None
 
 
 class MySQLMemoryStore:
+    """基于 MySQL 的长期记忆 store。"""
+
     def __init__(self):
         self.config = get_db_config()
         self._init_schema()
 
     def _connect(self):
+        """创建 MySQL 连接。"""
         return connect(**self.config)
 
     def _init_schema(self) -> None:
+        """幂等初始化记忆表和审核表。"""
         with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -82,6 +93,7 @@ class MySQLMemoryStore:
             conn.commit()
 
     def upsert_candidate(self, identity: MemoryIdentity, candidate: MemoryCandidate) -> str:
+        """直接写入一条候选记忆，并同步可选向量索引。"""
         with self._connect() as conn:
             cursor = conn.cursor()
             memory_id = self._upsert_candidate_with_cursor(cursor, identity, candidate)
@@ -91,6 +103,7 @@ class MySQLMemoryStore:
         return memory_id
 
     def _upsert_candidate_with_cursor(self, cursor, identity: MemoryIdentity, candidate: MemoryCandidate) -> str:
+        """在已有事务 cursor 中幂等写入候选。"""
         memory_id = candidate.stable_id(identity)
         now = _mysql_now()
         namespace = namespace_for(identity, candidate.scope, candidate.memory_type)
@@ -138,6 +151,7 @@ class MySQLMemoryStore:
         return memory_id
 
     def get_by_ids(self, identity: MemoryIdentity, memory_ids: List[str]) -> List[Dict[str, Any]]:
+        """按 ID 批量读取记忆，并强制 tenant/user/shop 可见性过滤。"""
         if not memory_ids:
             return []
         placeholders = ",".join(["%s"] * len(memory_ids))
@@ -162,6 +176,7 @@ class MySQLMemoryStore:
         return rows
 
     def search(self, identity: MemoryIdentity, query: str = "", top_k: int = 5) -> List[Dict[str, Any]]:
+        """MySQL LIKE fallback 检索。"""
         params: list[Any] = [identity.tenant_id, identity.user_id, identity.shop_id]
         sql = """
         SELECT id, tenant_id, user_id, shop_id, namespace, memory_type, key_name,
@@ -175,6 +190,7 @@ class MySQLMemoryStore:
           AND (shop_id IS NULL OR shop_id = %s)
         """
         for term in _query_terms(query)[:6]:
+            # 最多取 6 个关键词，避免用户长问题生成过长 LIKE 条件。
             sql += " AND (content LIKE %s OR summary LIKE %s OR key_name LIKE %s OR JSON_EXTRACT(tags, '$') LIKE %s)"
             like = f"%{term}%"
             params.extend([like, like, like, like])
@@ -187,6 +203,7 @@ class MySQLMemoryStore:
                 rows = cursor.fetchall()
                 if rows or not query:
                     return rows
+                # 带关键词搜不到时，回退到高重要性/高置信度记忆，保证 prompt 至少有可参考经验。
                 cursor.execute("""
                     SELECT id, tenant_id, user_id, shop_id, namespace, memory_type, key_name,
                            content, summary, source_type, source_thread_id, source_task_id,
@@ -205,6 +222,7 @@ class MySQLMemoryStore:
             return []
 
     def create_review(self, identity: MemoryIdentity, candidate: MemoryCandidate) -> str:
+        """创建或更新一条待审核记忆候选。"""
         review_id = candidate.stable_id(identity)
         now = _mysql_now()
         candidate_json = candidate_to_json(candidate)
@@ -241,6 +259,7 @@ class MySQLMemoryStore:
         return review_id
 
     def list_reviews(self, identity: MemoryIdentity, status: str = "pending", limit: int = 50) -> List[Dict[str, Any]]:
+        """列出当前身份可见的审核记录。"""
         params: list[Any] = [identity.tenant_id, identity.user_id, identity.shop_id]
         sql = """
         SELECT id, tenant_id, user_id, shop_id, conversation_id, task_id,
@@ -262,6 +281,7 @@ class MySQLMemoryStore:
             return cursor.fetchall()
 
     def approve_review(self, review_id: str, reviewer_id: str = "local_user", comment: str = "") -> Dict[str, Any]:
+        """批准审核候选：在同一事务中写入正式记忆并更新审核状态。"""
         now = _mysql_now()
         with self._connect() as conn:
             cursor = conn.cursor(dictionary=True)
@@ -293,6 +313,7 @@ class MySQLMemoryStore:
         return {**review, "status": "approved", "memory_id": memory_id, "reviewer_id": reviewer_id, "review_comment": comment}
 
     def reject_review(self, review_id: str, reviewer_id: str = "local_user", comment: str = "") -> Dict[str, Any]:
+        """拒绝审核候选，只更新审核状态，不写入正式记忆。"""
         now = _mysql_now()
         with self._connect() as conn:
             cursor = conn.cursor(dictionary=True)
@@ -313,17 +334,21 @@ class MySQLMemoryStore:
 
 
 def _query_terms(query: str) -> list[str]:
+    """把用户问题切成简单 LIKE 关键词。"""
     return [term.strip() for term in query.replace("，", " ").replace("。", " ").split() if term.strip()]
 
 
 def _mysql_now() -> str:
+    """返回 MySQL DATETIME 友好的 UTC 字符串。"""
     return utc_now().replace("T", " ").replace("+00:00", "")
 
 
 @lru_cache(maxsize=1)
 def get_memory_store() -> MySQLMemoryStore:
+    """进程级单例 store，避免每次任务重复建表检查。"""
     return MySQLMemoryStore()
 
 
 def init_memory_store() -> MySQLMemoryStore:
+    """显式初始化入口，供 FastAPI 启动或 smoke 调用。"""
     return get_memory_store()

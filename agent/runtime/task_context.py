@@ -78,11 +78,13 @@ def build_task_context(
     )
     session_dir = PROJECT_ROOT / "output" / f"session_{conversation_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
+    # Agent prompt 和工具统一使用正斜杠路径，减少 Windows 反斜杠被模型转义/误读的概率。
     session_dir_str = str(session_dir).replace("\\", "/")
     relative_session_dir_str = str(session_dir.relative_to(PROJECT_ROOT)).replace("\\", "/")
 
     updated_info_prompt = _copy_uploaded_files(conversation_id, session_dir)
 
+    # ContextVar 必须在调用 runner 前设置，数据库工具、文件工具、trace/monitor 都依赖这些上下文。
     session_dir_token = set_session_context(session_dir_str)
     thread_token = set_thread_context(conversation_id)
     identity_token = set_identity_context(identity)
@@ -90,6 +92,7 @@ def build_task_context(
 
     config = {
         "configurable": {
+            # LangGraph/checkpointer 使用 thread_id 区分会话；task_id/tenant/shop 用于审计和工具上下文。
             "thread_id": conversation_id,
             "checkpoint_ns": "main_agent",
             "task_id": task_id,
@@ -151,6 +154,7 @@ def _build_path_instruction(
 ) -> str:
     """构造追加到用户问题后的工作环境提示，包括长期记忆召回结果。"""
     started_at = time.perf_counter()
+    # 记忆召回属于可观测阶段：即使没有召回结果，也要让时间线显示该阶段已完成。
     tracer.emit(
         "memory_retrieval_started",
         trace_id=task_id,
@@ -180,6 +184,7 @@ def _build_path_instruction(
         metadata={"count": len(long_term_memories), "retrieval": long_term_memories[0].get("retrieval") if long_term_memories else None},
     )
     memory_context = format_long_term_memory_context(long_term_memories)
+    # 这段文本会追加到用户问题后交给 Agent，因此只放工作目录、上传文件和精选长期记忆，不放内部 token。
     return f"""
     【工作环境指令】
     工作目录: {relative_session_dir_str}

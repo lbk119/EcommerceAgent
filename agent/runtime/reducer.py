@@ -19,7 +19,11 @@ from agent.runtime.task_profiles import TaskExecutionProfile
 
 @dataclass(frozen=True)
 class ReducedResult:
-    """Reducer 的结构化输出。"""
+    """Reducer 的结构化输出。
+
+    deterministic_content 是纯规则生成的 Markdown；content 可能是 fast model 润色后的文本；
+    structured 是前端卡片展示的事实来源。
+    """
 
     content: str
     structured: dict[str, Any]
@@ -41,6 +45,7 @@ class Reducer:
         if message_id:
             from api.monitor import monitor
 
+            # AI Chat 先推确定性结果，用户不用等待可选 fast polish 完成。
             monitor.emit_assistant_delta(task_id=task_id, conversation_id=conversation_id, message_id=message_id, delta=deterministic_content)
         polished_content = await self._polish(query, run, structured, deterministic_content, trace_id=trace_id, task_id=task_id, conversation_id=conversation_id)
         latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
@@ -52,6 +57,7 @@ class Reducer:
         ok_results = {result.step: result for result in run.step_results if result.status == "ok"}
         missing_data = [item for result in run.step_results if result.status != "ok" for item in (result.missingData or [result.label])]
         workflow = run.plan.workflow_name
+        task_plan = run.plan.metadata.get("task_plan") if isinstance(run.plan.metadata.get("task_plan"), dict) else {}
         if workflow in {"inventory_analysis", "inventory_warning"}:
             conclusion, evidence, actions, risks = _inventory_result(ok_results)
         elif workflow == "campaign_review":
@@ -63,6 +69,7 @@ class Reducer:
         else:
             conclusion, evidence, actions, risks = _generic_result(ok_results)
         if run.has_critical_failure:
+            # 关键节点失败时仍返回结构化降级结果，但明确把风险放到最前面。
             risks.insert(0, "关键数据节点失败，当前结论为降级结果。")
         return {
             "workflow": workflow,
@@ -72,7 +79,13 @@ class Reducer:
             "actions": actions[:8],
             "risks": risks[:8],
             "missingData": missing_data,
+            "planSummary": task_plan or run.plan.to_dict(),
+            "stepResults": [result.to_dict() for result in run.step_results],
             "stepSummaries": [result.to_dict() for result in run.step_results],
+            "nextQuestions": task_plan.get("clarification_questions", []) if task_plan else [],
+            "confidence": task_plan.get("confidence", 0.7) if task_plan else 0.7,
+            "expectedOutput": run.plan.output_requirements,
+            "outputFormat": task_plan.get("output_format", "markdown") if task_plan else "markdown",
             "latencyMs": run.latencyMs,
             "timedOut": run.timedOut,
         }
@@ -91,6 +104,9 @@ class Reducer:
 
 结构化结果 JSON：
 {json.dumps(structured, ensure_ascii=False)}
+
+Planner 期望输出：
+{run.plan.output_requirements}
 
 要求：
 - 保留 conclusion、evidence、actions、risks、missingData 的事实。
@@ -177,6 +193,7 @@ def _generic_result(results: dict[str, StepResult]) -> tuple[str, list[str], lis
 
 
 def _render_markdown(structured: dict[str, Any]) -> str:
+    """把结构化结果渲染成稳定 Markdown，作为模型不可用时的主答案。"""
     lines = ["## 结论", str(structured.get("conclusion") or "暂无结论。")]
     for title, key in (("证据", "evidence"), ("建议动作", "actions"), ("风险", "risks"), ("缺失数据", "missingData")):
         items = structured.get(key) or []
@@ -189,8 +206,10 @@ def _render_markdown(structured: dict[str, Any]) -> str:
 
 
 def _product_line(row: dict[str, Any], *, prefix: str) -> str:
+    """把商品行转成证据短句。"""
     return f"{prefix}：{_product_name(row)}，销售额 {row.get('sales_amount') or row.get('sales_amount_30d') or 0}，销量 {row.get('units_sold') or row.get('units_sold_30d') or 0}，库存 {row.get('stock', 0)}。"
 
 
 def _product_name(row: dict[str, Any]) -> str:
+    """按优先级选择商品展示名。"""
     return str(row.get("product_name") or row.get("product_id") or row.get("category_name_en") or "商品")

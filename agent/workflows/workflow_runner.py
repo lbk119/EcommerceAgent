@@ -1,7 +1,7 @@
 """
 业务 Workflow 路由与执行器。
 
-这里不是通用 Planner，而是把 task_classifier 已经识别出的电商任务接到固定业务 DAG。这样高价值、
+这里不是通用 Planner，而是把 PlannerAgent 已经生成的 TaskPlan 接到固定业务 DAG。这样高价值、
 结构稳定的任务先走确定性流程，普通闲聊或未覆盖任务仍回落 DeepAgent。
 """
 
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 from agent.observability.tracer import tracer
-from agent.planning.task_classifier import TaskClassification
+from agent.planning.schemas import TaskPlan
 from agent.runtime.execution_result import ExecutionResult
 
 
@@ -24,14 +24,15 @@ class WorkflowRoute:
 
     workflow_name: str
     reason: str
+    plan: TaskPlan | None = None
 
 
 class WorkflowRouter:
     """
-    根据任务分类选择固定业务 workflow。
+    根据 PlannerAgent 的 TaskPlan 选择固定业务 workflow。
 
-    路由只看 classification，不重新理解用户意图。这样分类层和执行层职责清晰，后续如果分类器从
-    规则升级到模型，WorkflowRouter 不需要跟着改。
+    路由只看 plan，不重新理解用户意图。这样规划层和执行层职责清晰，后续 PlannerAgent 的实现
+    可以替换为模型、规则或混合策略，WorkflowRouter 不需要跟着改。
     """
 
     _TASK_TO_WORKFLOW = {
@@ -43,14 +44,16 @@ class WorkflowRouter:
         "product_optimization": "product_optimization",
     }
 
-    def route(self, classification: TaskClassification) -> Optional[WorkflowRoute]:
+    def route(self, task_plan: TaskPlan) -> Optional[WorkflowRoute]:
         """返回可执行 workflow；没有覆盖的 deterministic_dag 会交给 DeepAgent 兜底。"""
-        if classification.preferred_workflow != "deterministic_dag":
+        if task_plan.execution_mode in {"deterministic_dag", "hybrid_plan", "boundary", "deepagent"}:
+            return WorkflowRoute(workflow_name=task_plan.intent.primary_goal or task_plan.primary_task_type, reason=f"planner:{task_plan.execution_mode}", plan=task_plan)
+        if task_plan.execution_mode not in {"deterministic_dag", "hybrid_plan"}:
             return None
-        workflow_name = self._TASK_TO_WORKFLOW.get(classification.task_type)
+        workflow_name = self._TASK_TO_WORKFLOW.get(task_plan.primary_task_type)
         if not workflow_name:
             return None
-        return WorkflowRoute(workflow_name=workflow_name, reason=f"task_type:{classification.task_type}")
+        return WorkflowRoute(workflow_name=workflow_name, reason=f"task_type:{task_plan.primary_task_type}")
 
 
 class WorkflowRunner:
@@ -68,7 +71,7 @@ class WorkflowRunner:
         self,
         *,
         query: str,
-        classification: TaskClassification,
+        task_plan: TaskPlan,
         trace_id: str,
         task_id: str,
         conversation_id: str,
@@ -83,16 +86,35 @@ class WorkflowRunner:
         这里的 fallback 是一个函数而不是直接 import DeepAgent runner，是为了保持 WorkflowRunner
         与具体 Agent 框架解耦；未来切到其他 executor 也只需要换这个回调。
         """
-        route = self.router.route(classification)
+        route = self.router.route(task_plan)
         if not route:
-            self._trace_route(trace_id, task_id, conversation_id, classification, selected=False, reason="no_matching_workflow")
+            self._trace_route(trace_id, task_id, conversation_id, task_plan, selected=False, reason="no_matching_workflow")
             if not allow_deepagent_fallback:
-                return ExecutionResult(content=_deepagent_disabled_message(classification.task_type), source="workflow", fallback_reason="deepagent_disabled_for_ai_chat")
+                return ExecutionResult(content=_deepagent_disabled_message(task_plan.primary_task_type), source="workflow", fallback_reason="deepagent_disabled_for_ai_chat")
             return ExecutionResult.from_deepagent(await fallback(query), fallback_reason="no_matching_workflow")
 
-        self._trace_route(trace_id, task_id, conversation_id, classification, selected=True, reason=route.reason, workflow_name=route.workflow_name)
+        self._trace_route(trace_id, task_id, conversation_id, task_plan, selected=True, reason=route.reason, workflow_name=route.workflow_name)
+        if route.plan:
+            if route.plan.requires_clarification:
+                content = _clarification_answer(route.plan)
+                return ExecutionResult(content=content, source="planner_clarification", workflow_name=route.workflow_name, workflow_definition={"task_plan": route.plan.to_dict()}, structured_result=_planner_structured(route.plan, content))
+            if route.plan.execution_mode == "boundary":
+                content = _planner_boundary_answer(route.plan)
+                return ExecutionResult(content=content, source="planner_boundary", workflow_name=route.workflow_name, workflow_definition={"task_plan": route.plan.to_dict()}, structured_result=_planner_structured(route.plan, content))
+            if route.plan.execution_mode == "deepagent":
+                if not allow_deepagent_fallback:
+                    return ExecutionResult(content=_deepagent_disabled_message(task_plan.primary_task_type, route.workflow_name), source="planner_boundary", attempted_workflow=route.workflow_name, fallback_reason="deepagent_disabled_by_profile", workflow_definition={"task_plan": route.plan.to_dict()}, structured_result=_planner_structured(route.plan, _deepagent_disabled_message(task_plan.primary_task_type, route.workflow_name)))
+                tracer.emit(
+                    "deepagent_fallback_started",
+                    trace_id=trace_id,
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    agent_name="workflow_runner",
+                    metadata={"stage": "deep_agent", "status": "running", "workflow_name": route.workflow_name, "reason": "planner_deepagent", "plan_id": route.plan.plan_id},
+                )
+                return ExecutionResult.from_deepagent(await fallback(query), fallback_reason="planner_deepagent", attempted_workflow=route.workflow_name)
         try:
-            result = await self._run_workflow(route.workflow_name, query, trace_id, task_id, conversation_id, message_id=message_id, runtime_profile=runtime_profile, task_type=classification.task_type, allow_deepagent_fallback=allow_deepagent_fallback)
+            result = await self._run_workflow(route.workflow_name, query, trace_id, task_id, conversation_id, message_id=message_id, runtime_profile=runtime_profile, task_type=task_plan.primary_task_type, allow_deepagent_fallback=allow_deepagent_fallback, task_plan=route.plan)
             tracer.emit(
                 "workflow_finished",
                 trace_id=trace_id,
@@ -113,7 +135,7 @@ class WorkflowRunner:
                 metadata={"workflow_name": route.workflow_name, "fallback": "deepagent"},
             )
             if not allow_deepagent_fallback:
-                return ExecutionResult(content=_deepagent_disabled_message(classification.task_type, route.workflow_name), source="workflow", attempted_workflow=route.workflow_name, workflow_failed=True, fallback_reason="workflow_failed_deepagent_disabled")
+                return ExecutionResult(content=_deepagent_disabled_message(task_plan.primary_task_type, route.workflow_name), source="workflow", attempted_workflow=route.workflow_name, workflow_failed=True, fallback_reason="workflow_failed_deepagent_disabled")
             tracer.emit(
                 "deepagent_fallback_started",
                 trace_id=trace_id,
@@ -124,13 +146,18 @@ class WorkflowRunner:
             )
             return ExecutionResult.from_deepagent(await fallback(query), fallback_reason="workflow_failed", attempted_workflow=route.workflow_name, workflow_failed=True)
 
-    async def _run_workflow(self, workflow_name: str, query: str, trace_id: str, task_id: str, conversation_id: str, *, message_id: str = "", runtime_profile: str = "standard", task_type: str = "", allow_deepagent_fallback: bool = True) -> ExecutionResult:
-        plan_result = await self._run_plan_workflow(workflow_name, query, trace_id, task_id, conversation_id, message_id=message_id, runtime_profile=runtime_profile, task_type=task_type, allow_deepagent_fallback=allow_deepagent_fallback)
+    async def _run_workflow(self, workflow_name: str, query: str, trace_id: str, task_id: str, conversation_id: str, *, message_id: str = "", runtime_profile: str = "standard", task_type: str = "", allow_deepagent_fallback: bool = True, task_plan: TaskPlan | None = None) -> ExecutionResult:
+        """执行一个已命中的 workflow。
+
+        当前所有 workflow 都走 PlanRegistry + ParallelExecutor + Reducer；如果未来保留 legacy workflow，
+        可以在这里按 workflow_name 分流。
+        """
+        plan_result = await self._run_plan_workflow(workflow_name, query, trace_id, task_id, conversation_id, message_id=message_id, runtime_profile=runtime_profile, task_type=task_type, allow_deepagent_fallback=allow_deepagent_fallback, task_plan=task_plan)
         if plan_result:
             return plan_result
         raise ValueError(f"PlanRegistry 未覆盖 workflow: {workflow_name}")
 
-    async def _run_plan_workflow(self, workflow_name: str, query: str, trace_id: str, task_id: str, conversation_id: str, *, message_id: str = "", runtime_profile: str = "standard", task_type: str = "", allow_deepagent_fallback: bool = True) -> ExecutionResult | None:
+    async def _run_plan_workflow(self, workflow_name: str, query: str, trace_id: str, task_id: str, conversation_id: str, *, message_id: str = "", runtime_profile: str = "standard", task_type: str = "", allow_deepagent_fallback: bool = True, task_plan: TaskPlan | None = None) -> ExecutionResult | None:
         """
         新商业化执行链路：规则 Planner 一次性生成固定 DAG，ParallelExecutor 并行执行，Reducer 统一汇总。
 
@@ -143,16 +170,19 @@ class WorkflowRunner:
         from agent.runtime.reducer import Reducer
         from agent.runtime.task_profiles import get_task_execution_profile
 
-        plan = PlanRegistry().plan(task_type or workflow_name, query, workflow_name=workflow_name)
+        registry = PlanRegistry()
+        plan = registry.from_task_plan(task_plan) if task_plan else registry.plan(task_type or workflow_name, query, workflow_name=workflow_name)
         if not plan:
             return None
         profile = get_task_execution_profile(runtime_profile)
+        # 固定计划一旦生成，就交给并行执行器；不在执行过程中动态追加 step，保证耗时可预测。
         executor = ParallelExecutor(profile)
         run_result = await executor.execute(plan, trace_id=trace_id, task_id=task_id, conversation_id=conversation_id)
         if run_result.has_critical_failure and allow_deepagent_fallback:
             failed_steps = [result.step for result in run_result.step_results if result.critical and result.status != "ok"]
             raise RuntimeError(f"关键计划节点失败，允许 fallback DeepAgent: {failed_steps}")
         reduced = await Reducer(profile).reduce(run_result, query=query, trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, message_id=message_id)
+        # workflow_definition 是本次执行计划的快照，后续 trace/报告/排障都可以还原执行路径。
         workflow_definition = {**plan.to_dict(), "executor": "plan_parallel", "structured": True, "reducer": "deterministic_then_fast_polish"}
         return ExecutionResult(
             content=reduced.content,
@@ -178,12 +208,13 @@ class WorkflowRunner:
         trace_id: str,
         task_id: str,
         conversation_id: str,
-        classification: TaskClassification,
+        task_plan: TaskPlan,
         *,
         selected: bool,
         reason: str,
         workflow_name: str = "",
     ) -> None:
+        """记录 workflow 路由决策，前端 timeline 和 smoke 都依赖该事件判断是否命中固定 DAG。"""
         tracer.emit(
             "workflow_route_decided",
             trace_id=trace_id,
@@ -194,12 +225,13 @@ class WorkflowRunner:
                 "selected": selected,
                 "reason": reason,
                 "workflow_name": workflow_name,
-                "task_classification": classification.to_dict(),
+                **task_plan.to_trace_metadata(),
             },
         )
 
 
 def _deepagent_disabled_message(task_type: str, attempted_workflow: str = "") -> str:
+    """AI Chat 禁用 DeepAgent fallback 时返回的边界说明。"""
     workflow_note = f"，尝试的 workflow 为 `{attempted_workflow}`" if attempted_workflow else ""
     return (
         f"当前问题类型 `{task_type}`{workflow_note} 需要更开放的深度推理。"
@@ -207,3 +239,35 @@ def _deepagent_disabled_message(task_type: str, attempted_workflow: str = "") ->
         "以避免普通对话长时间等待。你可以把问题拆成具体的商品、库存、活动或报告任务后重新发送，"
         "或在后台深度任务中启用 DeepAgent。"
     )
+
+
+def _clarification_answer(plan: TaskPlan) -> str:
+    questions = plan.clarification_questions or ["请补充要分析的对象或时间范围。"]
+    lines = ["## 需要补充信息", "为了避免误读你的需求，我需要先确认："]
+    lines.extend([f"- {question}" for question in questions])
+    return "\n".join(lines)
+
+
+def _planner_boundary_answer(plan: TaskPlan) -> str:
+    return (
+        "## 当前能力边界\n"
+        "我现在只接入了电商经营数据、商品、库存、活动、导入和报告相关能力，不能可靠处理这个问题。\n\n"
+        "## 可以继续这样问\n"
+        "- 推荐我最近爆品\n"
+        "- 帮我看看店铺最近怎么样\n"
+        "- 这个月哪些商品适合加大投放，同时看库存和活动风险"
+    )
+
+
+def _planner_structured(plan: TaskPlan, content: str) -> dict:
+    return {
+        "conclusion": content,
+        "evidence": [],
+        "actions": [],
+        "risks": [],
+        "missingData": plan.missing_context,
+        "planSummary": plan.to_dict(),
+        "stepResults": [],
+        "nextQuestions": plan.clarification_questions,
+        "confidence": plan.confidence,
+    }

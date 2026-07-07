@@ -12,6 +12,7 @@ from api.services.agent_job_prompts import build_agent_query
 from api.services.ecommerce_queries import AGENT_DEFINITIONS, normalize_time
 from api.task_queue import task_queue
 from api.task_runtime import task_runtime
+from agent.planning.planner_agent import planner_agent
 
 
 def agent_name(agent_id: str) -> str:
@@ -33,6 +34,7 @@ async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id:
     job_id = str(uuid.uuid4())
     result_report_id = params.get("reportId") or params.get("report_id")
     runtime_profile = str(payload.get("runtimeProfile") or payload.get("runtime_profile") or _runtime_profile_for_job(job_type))
+    task_plan = _task_plan_for_job(job_type, query, runtime_profile)
     execute(
         """
         INSERT INTO agent_jobs (id, tenant_id, shop_id, agent_id, agent_name, job_type, title, status, task_id, conversation_id, params_json, result_report_id, created_by)
@@ -40,8 +42,8 @@ async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id:
         """,
         (job_id, tenant_id, shop_id, agent_id, agent_name(agent_id), job_type, title, task_id, conversation_id, json.dumps(params, ensure_ascii=False), result_report_id, user_id),
     )
-    await task_runtime.enqueue(task_id, query, metadata={"conversation_id": conversation_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "agent_job_id": job_id, "runtime_profile": runtime_profile})
-    await task_queue.enqueue({"query": query, "conversation_id": conversation_id, "thread_id": conversation_id, "task_id": task_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "runtime_profile": runtime_profile, "job_type": job_type, "source": "agent_job"})
+    await task_runtime.enqueue(task_id, query, metadata={"conversation_id": conversation_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "agent_job_id": job_id, "runtime_profile": runtime_profile, "task_plan": task_plan.to_lightweight_dict(), "intent": task_plan.primary_task_type})
+    await task_queue.enqueue({"query": query, "conversation_id": conversation_id, "thread_id": conversation_id, "task_id": task_id, "tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id, "runtime_profile": runtime_profile, "job_type": job_type, "source": "agent_job", "intent": task_plan.primary_task_type, "task_plan": task_plan.to_dict()})
     return {"id": job_id, "jobId": job_id, "agentId": agent_id, "jobType": job_type, "title": title, "status": "running", "taskId": task_id, "conversationId": conversation_id, "resultReportId": result_report_id, "runtimeProfile": runtime_profile}
 
 
@@ -49,6 +51,26 @@ def _runtime_profile_for_job(job_type: str | None) -> str:
     """数字员工默认走 standard；管理层报告和复杂周期报告才走 deep。"""
     deep_job_types = {"weekly_report", "monthly_report", "management_report", "strategy_diagnosis", "cross_platform_attribution"}
     return "deep" if str(job_type or "") in deep_job_types else "standard"
+
+
+def _task_plan_for_job(job_type: str | None, query: str, runtime_profile: str):
+    """用稳定 jobType 生成计划，避免内部长 prompt 误命中过多 capability。"""
+    planner_query = {
+        "product_optimization": "商品优化",
+        "hot_product_analysis": "爆品分析",
+        "daily_report": "经营日报",
+        "weekly_report": "经营周报",
+        "campaign_review": "活动复盘",
+        "inventory_risk_scan": "库存风险",
+        "replenishment_plan": "补货计划",
+    }.get(str(job_type or ""), query)
+    plan = planner_agent.plan(planner_query, profile=runtime_profile)
+    plan_data = plan.to_dict()
+    plan_data["raw_query"] = query
+    plan_data["intent"] = {**plan.intent.to_dict(), "raw_query": query, "normalized_query": query}
+    from agent.planning.schemas import TaskPlan
+
+    return TaskPlan.from_dict(plan_data)
 
 
 def list_agent_jobs(tenant_id: str, shop_id: str, agent_id: str | None = None) -> list[dict]:

@@ -23,12 +23,19 @@ from agent.runtime.task_profiles import TaskExecutionProfile
 
 @dataclass(frozen=True)
 class StepResult:
-    """单个计划 step 的结构化结果。"""
+    """单个计划 step 的结构化结果。
+
+    status 使用 ok/failed/timeout；critical 表示该 step 失败是否会导致整体结果降级或 fallback。
+    rows 保存 JSON-ready 结构化数据，summary 用于 trace/前端快速展示。
+    """
 
     step: str
     label: str
     status: str
     critical: bool
+    step_id: str = ""
+    expert: str = "data_expert"
+    dependencyStatus: str = "ready"
     rows: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     latencyMs: float = 0
@@ -38,9 +45,12 @@ class StepResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "step": self.step,
+            "step_id": self.step_id or self.step,
             "label": self.label,
             "status": self.status,
             "critical": self.critical,
+            "expert": self.expert,
+            "dependencyStatus": self.dependencyStatus,
             "rows": self.rows,
             "summary": self.summary,
             "latencyMs": self.latencyMs,
@@ -76,32 +86,61 @@ class ParallelExecutor:
         self.profile = profile
 
     async def execute(self, plan: ExecutionPlan, *, trace_id: str, task_id: str, conversation_id: str) -> PlanRunResult:
-        """并行执行计划中所有互不依赖的 step。"""
+        """执行计划 DAG。
+
+        无依赖 step 会在同一批并行执行；有 depends_on 的 step 等依赖成功后再进入下一批。
+        """
         started_at = time.perf_counter()
+        plan_id = str(plan.metadata.get("task_plan", {}).get("plan_id") or plan.metadata.get("plan_id") or "")
         tracer.emit(
             "plan_execution_started",
             trace_id=trace_id,
             task_id=task_id,
             conversation_id=conversation_id,
             agent_name="parallel_executor",
-            metadata={"workflow_name": plan.workflow_name, "step_count": len(plan.steps), "profile": self.profile.name, "global_timeout_seconds": self.profile.global_timeout_seconds},
+            metadata={"workflow_name": plan.workflow_name, "plan_id": plan_id, "step_count": len(plan.steps), "profile": self.profile.name, "global_timeout_seconds": self.profile.global_timeout_seconds},
         )
-        for step in plan.steps:
-            metadata = self._step_metadata(plan, step)
-            tracer.emit("plan_step_started", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", metadata=metadata)
-            tracer.emit("workflow_step_started", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", metadata=metadata)
-        tasks = [asyncio.create_task(self._run_step(plan, step, trace_id=trace_id, task_id=task_id, conversation_id=conversation_id)) for step in plan.steps]
-        done, pending = await asyncio.wait(tasks, timeout=self.profile.global_timeout_seconds)
-        timed_out = bool(pending)
         step_results: list[StepResult] = []
-        for task in done:
-            step_results.append(task.result())
-        for task in pending:
-            task.cancel()
-        for task, step in zip(tasks, plan.steps):
-            if task in pending:
-                step_results.append(StepResult(step=step.name, label=step.label, status="timeout", critical=step.critical, latencyMs=round(self.profile.global_timeout_seconds * 1000, 2), error="plan global timeout", missingData=[step.label]))
-        step_results.sort(key=lambda result: [step.name for step in plan.steps].index(result.step) if result.step in [step.name for step in plan.steps] else 999)
+        completed: dict[str, StepResult] = {}
+        remaining = list(plan.steps)
+        timed_out = False
+        while remaining:
+            elapsed = time.perf_counter() - started_at
+            remaining_timeout = self.profile.global_timeout_seconds - elapsed
+            if remaining_timeout <= 0:
+                timed_out = True
+                for step in remaining:
+                    step_results.append(self._timeout_result(step, self.profile.global_timeout_seconds, "plan global timeout", dependency_status="global_timeout"))
+                break
+            ready, blocked = _ready_steps(remaining, completed)
+            if not ready:
+                for step in blocked:
+                    step_results.append(StepResult(step=step.name, step_id=step.step_id or step.name, label=step.label, status="failed", critical=step.critical, expert=step.expert, dependencyStatus="blocked", error="dependency not satisfied", missingData=[step.label]))
+                break
+            for step in ready:
+                metadata = self._step_metadata(plan, step, dependency_status="ready")
+                tracer.emit("plan_step_started", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", metadata=metadata)
+                tracer.emit("workflow_step_started", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", metadata=metadata)
+            tasks = [asyncio.create_task(self._run_step(plan, step, trace_id=trace_id, task_id=task_id, conversation_id=conversation_id)) for step in ready]
+            done, pending = await asyncio.wait(tasks, timeout=remaining_timeout)
+            if pending:
+                timed_out = True
+            for task in done:
+                result = task.result()
+                step_results.append(result)
+                completed[result.step_id or result.step] = result
+                completed[result.step] = result
+            for task in pending:
+                task.cancel()
+            for task, step in zip(tasks, ready):
+                if task in pending:
+                    result = self._timeout_result(step, remaining_timeout, "plan global timeout", dependency_status="global_timeout")
+                    step_results.append(result)
+                    completed[result.step_id or result.step] = result
+                    completed[result.step] = result
+            remaining = [step for step in blocked if step not in ready]
+        order = {step.step_id or step.name: index for index, step in enumerate(plan.steps)}
+        step_results.sort(key=lambda result: order.get(result.step_id or result.step, 999))
         latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
         tracer.emit(
             "plan_execution_finished",
@@ -110,7 +149,7 @@ class ParallelExecutor:
             conversation_id=conversation_id,
             agent_name="parallel_executor",
             latency_ms=latency_ms,
-            metadata={"workflow_name": plan.workflow_name, "profile": self.profile.name, "timed_out": timed_out, "critical_failed": any(result.critical and result.status != "ok" for result in step_results), "steps": [result.to_dict() for result in step_results]},
+            metadata={"workflow_name": plan.workflow_name, "plan_id": plan_id, "profile": self.profile.name, "timed_out": timed_out, "critical_failed": any(result.critical and result.status != "ok" for result in step_results), "steps": [result.to_dict() for result in step_results]},
         )
         return PlanRunResult(plan=plan, step_results=step_results, latencyMs=latency_ms, timedOut=timed_out)
 
@@ -123,6 +162,7 @@ class ParallelExecutor:
             worker_task = asyncio.create_task(asyncio.to_thread(self._invoke_step, step, plan))
             done, pending = await asyncio.wait({worker_task}, timeout=timeout_seconds)
             if pending:
+                # 单 step 超时不等待底层线程返回，直接把该 step 标记为 timeout。
                 worker_task.cancel()
                 raise asyncio.TimeoutError()
             raw_result = next(iter(done)).result()
@@ -138,7 +178,7 @@ class ParallelExecutor:
             if not rows:
                 raise RuntimeError("empty_result")
             latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            result = StepResult(step=step.name, label=step.label, status="ok", critical=step.critical, rows=rows, summary=_summarize_step(step.name, rows), latencyMs=latency_ms)
+            result = StepResult(step=step.name, step_id=step.step_id or step.name, label=step.label, status="ok", critical=step.critical, expert=step.expert, dependencyStatus="ready", rows=rows, summary=_summarize_step(step.name, rows), latencyMs=latency_ms)
             finish_metadata = {**metadata, "row_count": len(rows), "summary": result.summary, "structured": True, "result_preview": result.summary}
             tracer.emit("plan_step_finished", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", latency_ms=latency_ms, metadata=finish_metadata)
             tracer.emit("workflow_step_finished", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", latency_ms=latency_ms, metadata=finish_metadata)
@@ -146,15 +186,19 @@ class ParallelExecutor:
         except Exception as error:
             latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
             status = "timeout" if isinstance(error, asyncio.TimeoutError) else "failed"
-            result = StepResult(step=step.name, label=step.label, status=status, critical=step.critical, latencyMs=latency_ms, error=str(error)[:1000], missingData=[step.label])
+            result = StepResult(step=step.name, step_id=step.step_id or step.name, label=step.label, status=status, critical=step.critical, expert=step.expert, dependencyStatus="ready", latencyMs=latency_ms, error=str(error)[:1000], missingData=[step.label])
             fail_metadata = {**metadata, "status": status, "missing_data": result.missingData, "structured": True}
             tracer.emit("plan_step_failed", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", latency_ms=latency_ms, error=result.error, metadata=fail_metadata)
             tracer.emit("workflow_step_failed", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="parallel_executor", latency_ms=latency_ms, error=result.error, metadata=fail_metadata)
             return result
 
-    def _step_metadata(self, plan: ExecutionPlan, step: PlanStep) -> dict[str, Any]:
+    def _step_metadata(self, plan: ExecutionPlan, step: PlanStep, *, dependency_status: str = "ready") -> dict[str, Any]:
         timeout_seconds = float(step.timeout_seconds or self.profile.step_timeout_seconds)
-        return {"step_name": step.label, "step_key": step.name, "required": step.critical, "critical": step.critical, "time_range": plan.time_range.label, "workflow_name": plan.workflow_name, "parallel_group": plan.workflow_name, "timeout_seconds": timeout_seconds}
+        plan_id = str(plan.metadata.get("task_plan", {}).get("plan_id") or plan.metadata.get("plan_id") or "")
+        return {"plan_id": plan_id, "step_id": step.step_id or step.name, "expert": step.expert, "dependency_status": dependency_status, "depends_on": list(step.depends_on), "step_name": step.label, "step_key": step.name, "required": step.critical, "critical": step.critical, "time_range": plan.time_range.label, "workflow_name": plan.workflow_name, "parallel_group": plan.workflow_name, "timeout_seconds": timeout_seconds}
+
+    def _timeout_result(self, step: PlanStep, timeout_seconds: float, error: str, *, dependency_status: str) -> StepResult:
+        return StepResult(step=step.name, step_id=step.step_id or step.name, label=step.label, status="timeout", critical=step.critical, expert=step.expert, dependencyStatus=dependency_status, latencyMs=round(timeout_seconds * 1000, 2), error=error, missingData=[step.label])
 
     def _invoke_step(self, step: PlanStep, plan: ExecutionPlan) -> str | list[dict[str, Any]]:
         """调用固定业务查询函数。"""
@@ -209,6 +253,28 @@ def _execute_rows(query: str) -> list[dict[str, Any]]:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(query)
             return [{key: _json_value(value) for key, value in row.items()} for row in cursor.fetchall()]
+
+
+def _ready_steps(steps: list[PlanStep], completed: dict[str, StepResult]) -> tuple[list[PlanStep], list[PlanStep]]:
+    """根据依赖完成状态拆出当前可执行 step。"""
+    ready: list[PlanStep] = []
+    blocked: list[PlanStep] = []
+    pending_keys = {step.step_id or step.name for step in steps} | {step.name for step in steps}
+    for step in steps:
+        dependencies = list(step.depends_on or [])
+        if not dependencies:
+            ready.append(step)
+            continue
+        failed_dependency = any((completed.get(dep) and completed[dep].status != "ok") for dep in dependencies)
+        if failed_dependency:
+            blocked.append(step)
+            continue
+        waiting_dependency = any(dep not in completed and dep in pending_keys for dep in dependencies)
+        if waiting_dependency:
+            blocked.append(step)
+        else:
+            ready.append(step)
+    return ready, blocked
 
 
 def _query_hot_product_rows(plan: ExecutionPlan, *, limit: int) -> list[dict[str, Any]]:
@@ -362,6 +428,7 @@ LIMIT {limit}
 
 
 def _json_value(value: Any) -> Any:
+    """把 MySQL 返回的 Decimal/datetime 转成 JSON 友好的基础类型。"""
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, (datetime, date)):
@@ -415,6 +482,7 @@ def _summarize_step(step_name: str, rows: list[dict[str, Any]]) -> str:
 
 
 def _coerce_value(value: Any) -> Any:
+    """把 CSV 文本单元格尽量转成 int/float，失败时保留字符串。"""
     if value is None:
         return ""
     text = str(value).strip()
@@ -429,4 +497,5 @@ def _coerce_value(value: Any) -> Any:
 
 
 def _is_query_error(result: str) -> bool:
+    """识别旧文本查询函数返回的错误消息。"""
     return any(marker in result for marker in ("查询出现异常", "查询被拒绝", "缺失数据库核心配置"))

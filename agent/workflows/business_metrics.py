@@ -28,6 +28,7 @@ class BusinessTimeRange:
     campaign_keyword: str = ""
 
     def to_metadata(self) -> dict:
+        """转换为 trace/structuredResult 可序列化的时间范围结构。"""
         return {
             "label": self.label,
             "days": self.days,
@@ -39,6 +40,7 @@ class BusinessTimeRange:
 
 def parse_business_time_range(query: str) -> BusinessTimeRange:
     """从用户 query 中解析 today/yesterday/last_7d/last_30d/custom 等轻量时间范围。"""
+    # 简单规则解析即可满足高频经营问法；不调用 LLM，避免 workflow 起步就产生模型成本。
     compact_query = query.lower().replace(" ", "")
     if any(keyword in compact_query for keyword in ("今天", "今日", "today")):
         return BusinessTimeRange("today", 1)
@@ -68,6 +70,7 @@ def query_daily_metrics(time_range: BusinessTimeRange | None = None) -> str:
     默认最近 30 天；如果用户 query 解析出今天、昨天、本周或最近 N 天，则使用对应时间窗口。
     """
     time_range = time_range or BusinessTimeRange("last_30d", 30)
+    # 每个参与 JOIN 的经营表都加 tenant/shop scope，防止 JOIN 时某张表漏过滤导致跨租户混数。
     data_scope = _required_data_scope("o")
     item_scope = _required_data_scope("oi")
     review_scope = _required_data_scope("r")
@@ -187,6 +190,7 @@ def query_shop_profile() -> str:
     identity = get_identity_context()
     if not identity or not identity.tenant_id or not identity.shop_id:
         raise RuntimeError("缺少可信 tenant/shop 上下文，无法执行店铺画像 workflow")
+    # 店铺画像来自平台表，仍使用当前身份上下文限制到当前租户/店铺。
     tenant_id = _sql_literal(identity.tenant_id)
     shop_id = _sql_literal(identity.shop_id)
     return execute_read_sql_raw(f"""
@@ -447,13 +451,17 @@ def query_hot_products(time_range: BusinessTimeRange | None = None, limit: int =
     查询爆品分析的完整候选指标。
 
     这个查询是 DeepAgent 自由调库的确定性替代：一次 SQL 覆盖销售、流量、转化、价格、库存、活动和退款，
-    避免主 Agent 因为缺少终止信号而反复调用数据库助手。多租户/多店铺隔离仍由网关注入身份和数据库层
-    后续的店铺字段过滤承接；当前 demo 数据没有真实 shop_id 字段，所以这里只做业务指标聚合。
+    避免主 Agent 因为缺少终止信号而反复调用数据库助手。多租户/多店铺隔离由 api.context 中的身份
+    上下文和 _required_data_scope 强制拼接到每张经营表上。
     """
     time_range = time_range or BusinessTimeRange("last_30d", 30)
     limit = max(1, min(int(limit), 20))
 
     def run_query(active_time_range: BusinessTimeRange) -> str:
+        """按给定时间范围执行爆品聚合 SQL。
+
+        拆成内部函数是为了在短时间窗口无数据时复用同一套 SQL，自动扩大到最近 365 天。
+        """
         order_bound_scope = _required_data_scope("orders")
         traffic_bound_scope = _required_data_scope("traffic_stats")
         refund_bound_scope = _required_data_scope("refunds")
@@ -574,7 +582,11 @@ LIMIT {limit}
 
 
 def _time_filter(column: str, anchor_sql: str, time_range: BusinessTimeRange) -> str:
-    """生成相对业务锚点日期的 SQL 时间过滤条件。"""
+    """生成相对业务锚点日期的 SQL 时间过滤条件。
+
+    anchor_sql 通常是业务表里的 MAX(date)；这样 demo 数据的“今天”会落在数据自身最新日期，
+    而不是机器当前日期。
+    """
     if time_range.label == "today":
         start_expr = f"DATE({anchor_sql})"
         end_expr = f"DATE_ADD(DATE({anchor_sql}), INTERVAL 1 DAY)"
@@ -587,6 +599,11 @@ def _time_filter(column: str, anchor_sql: str, time_range: BusinessTimeRange) ->
 
 
 def _required_data_scope(alias: str) -> str:
+    """返回必须存在的 tenant/shop 过滤条件。
+
+    与 core.db.current_data_scope_sql 不同，这里缺少上下文会直接抛异常，因为 deterministic workflow
+    不允许在身份不可信时读取经营数据。
+    """
     scope = current_data_scope_sql(alias)
     if not scope:
         raise RuntimeError("缺少可信 tenant/shop 上下文，无法执行经营数据 workflow")
@@ -601,6 +618,7 @@ def _sql_literal(value: str) -> str:
 def _campaign_time_filter(time_range: BusinessTimeRange) -> str:
     """活动表按活动起止时间粗过滤；没有日粒度统计日期时，用活动窗口和业务时间范围相交判断。"""
     if time_range.campaign_keyword:
+        # 大促/618/双十一这类活动优先按活动名关键词过滤，比固定日期更贴近运营语义。
         return f"c.campaign_name LIKE '%{time_range.campaign_keyword}%'"
     anchor_sql = "(SELECT MAX(end_time) FROM campaigns)"
     if time_range.label == "today":

@@ -13,6 +13,7 @@ from agent.runtime.budget import AgentExecutionBudget
 
 
 PROFILE_ALIASES = {
+    # 兼容历史命名，避免 API/脚本里旧 profile 直接失效。
     "lightweight": "realtime",
     "chat": "realtime",
     "fast": "realtime",
@@ -35,13 +36,22 @@ class AgentRuntimeProfile:
 
 
 def normalize_runtime_profile(profile: str | None) -> str:
-    """兼容旧 runtime_profile 名称。"""
+    """兼容旧 runtime_profile 名称。
+
+    未识别值统一回退 standard，而不是抛错；这样外部 API 参数错误不会误触 deep 重路径。
+    """
     value = (profile or "standard").strip().lower()
     return PROFILE_ALIASES.get(value, value if value in {"realtime", "standard", "deep"} else "standard")
 
 
 def build_execution_budget(profile: str | None) -> AgentExecutionBudget:
-    """按 profile 构建单任务预算；环境变量可覆盖默认值。"""
+    """按 profile 构建单任务预算；环境变量可覆盖默认值。
+
+    三个 profile 的核心差异：
+    - realtime：AI Chat 热路径，短时间、少调用、无子 Agent、无记忆写入；
+    - standard：普通后台任务，允许少量工具/模型，但禁止网络搜索和长期记忆写入；
+    - deep：显式深度任务，允许更长时间、更多子 Agent、记忆写入和策略进化。
+    """
     name = normalize_runtime_profile(profile)
     if name == "realtime":
         return AgentExecutionBudget(
@@ -90,7 +100,10 @@ def build_execution_budget(profile: str | None) -> AgentExecutionBudget:
 
 
 def get_runtime_profile(profile: str | None) -> AgentRuntimeProfile:
-    """返回完整 profile 配置。"""
+    """返回完整 profile 配置。
+
+    agent_mode 决定是否构建 DeepAgent：realtime 为 none，standard 为 slim，deep 为 full。
+    """
     budget = build_execution_budget(profile)
     return AgentRuntimeProfile(
         name=budget.profile,
@@ -104,8 +117,10 @@ def get_runtime_profile(profile: str | None) -> AgentRuntimeProfile:
 
 
 def _int_env(name: str, default: int) -> int:
+    """读取整数环境变量。"""
     return int(os.getenv(name, str(default)))
 
 
 def _float_env(name: str, default: float) -> float:
+    """读取浮点环境变量。"""
     return float(os.getenv(name, str(default)))

@@ -26,7 +26,7 @@ from agent.evolution.reflection import build_task_reflection
 from agent.memory.evolution_memory import append_reflection, append_task_event
 from agent.memory.writer import write_memories_after_task
 from agent.observability.tracer import tracer
-from agent.planning.task_classifier import TaskClassification
+from agent.planning.schemas import TaskPlan
 from agent.runtime.agent_runner import LoopDetectedError, get_tool_calls_for_task
 from agent.runtime.task_context import TaskRunContext
 from agent.security.redaction import redact_secrets
@@ -50,7 +50,7 @@ async def run_critic_stage(
     *,
     agent_specs: Optional[Sequence[AgentSpec]] = None,
     rerun_with_fix: Optional[CriticRevisionRunner] = None,
-    task_classification: Optional[TaskClassification] = None,
+    task_plan: Optional[TaskPlan] = None,
 ) -> CriticStageResult:
     """
     质量校验阶段。
@@ -63,7 +63,7 @@ async def run_critic_stage(
         final_result,
         agent_specs=agent_specs or [],
         rerun_with_fix=rerun_with_fix,
-        task_classification=task_classification,
+        task_plan=task_plan,
     )
     return CriticStageResult(content=content, critic_status=critic_status)
 
@@ -80,6 +80,7 @@ def persist_result(context: TaskRunContext, final_result: str, *, runtime_profil
     safe_result = redact_secrets(final_result)
     append_task_event("task_completed", context.task_id, {"result": safe_result, "conversation_id": context.conversation_id})
     if runtime_profile == "deep":
+        # 反思和策略进化只放在 deep 路径，避免 AI Chat/standard 每次任务都写重型副产物。
         reflection = build_task_reflection(context.query, result=safe_result)
         append_reflection(context.task_id, context.query, reflection["status"], reflection["summary"], reflection["lessons"])
         create_policy_proposal(context.task_id, context.query, reflection)
@@ -101,6 +102,7 @@ def write_memory(context: TaskRunContext, final_result: str, reflection: dict, e
     tracer.emit("memory_write_started", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="memory_writer", metadata={"stage": "memory_write", "status": "running"})
     safe_result = redact_secrets(final_result)
     execution_metadata = execution_metadata or {}
+    # memory writer 会按质量门控决定是否真正写入，这里只负责传入脱敏后的候选信息。
     memory_write_result = write_memories_after_task(context.identity, context.query, safe_result, reflection.get("lessons", []), execution_metadata=execution_metadata)
     memory_event_metadata = {"conversation_id": context.conversation_id, **memory_write_result, "execution_metadata": execution_metadata}
     append_task_event("memory_write_completed", context.task_id, memory_event_metadata)
@@ -155,7 +157,7 @@ async def _apply_critic_if_needed(
     *,
     agent_specs: Sequence[AgentSpec],
     rerun_with_fix: Optional[CriticRevisionRunner],
-    task_classification: Optional[TaskClassification],
+    task_plan: Optional[TaskPlan],
 ) -> tuple[str, CriticStatus]:
     """
     对高价值任务执行 Critic。
@@ -164,6 +166,7 @@ async def _apply_critic_if_needed(
     Critic -> Agent -> Critic 的无限循环。
     """
     if not _critic_enabled() or not final_result:
+        # 没有内容时跳过 Critic，否则 Critic 只能检查空文本，反而制造噪声。
         tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "disabled_or_empty"})
         return final_result, "skipped"
 
@@ -171,7 +174,7 @@ async def _apply_critic_if_needed(
         context.query,
         agent_specs=agent_specs,
         tool_calls=get_tool_calls_for_task(context.task_id),
-        task_classification=task_classification,
+        task_plan=task_plan,
     )
     tracer.emit(
         "critic_policy_evaluated",
@@ -191,6 +194,7 @@ async def _apply_critic_if_needed(
 
     max_revisions = int(os.getenv("CRITIC_MAX_REVISIONS", "1"))
     if rerun_with_fix and max_revisions > 0:
+        # 只允许一次受控修正，防止 Critic 与 Agent 形成互相重跑的循环。
         revised_result = await _run_single_critic_revision(context, final_result, critic_result, rerun_with_fix)
         if revised_result:
             revised_critic_result = await run_critic(context.query, revised_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)
@@ -241,6 +245,7 @@ async def _run_single_critic_revision(
 
 
 def _build_critic_fix_prompt(task_query: str, final_result: str, critic_result: CriticResult) -> str:
+    """把 Critic 发现的问题转换成一次性修复提示。"""
     issue_lines = [f"- {issue.type}: {issue.message}" for issue in critic_result.issues]
     fix_instruction = critic_result.fix_instruction or "请补充缺失的数据来源、指标或结论依据。"
     return f"""

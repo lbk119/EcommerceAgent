@@ -14,16 +14,21 @@ from agent.observability.trace_reader import list_task_traces
 
 
 def diagnose_task(task_id: str) -> dict[str, Any]:
-    """返回单任务慢因诊断。"""
+    """返回单任务慢因诊断。
+
+    诊断结果只依赖 trace 事件，不重新访问业务库或调用模型，因此可以安全用于线上应急面板。
+    """
     events = list_task_traces(task_id)
     if not events:
         return {"taskId": task_id, "found": False, "recommendations": ["未找到 trace 事件，请确认 taskId 是否正确或 trace 写入是否开启。"]}
 
+    # 总耗时用第一条和最后一条 trace 时间估算，适合定位端到端任务耗时。
     timestamps = [_parse_timestamp(event.get("timestamp")) for event in events]
     timestamps = [timestamp for timestamp in timestamps if timestamp]
     total_latency_ms = round((max(timestamps) - min(timestamps)).total_seconds() * 1000, 2) if len(timestamps) >= 2 else 0
     event_types = [str(event.get("event_type") or "") for event in events]
     metadata_list = [event.get("metadata") or {} for event in events]
+    # 统计 started 事件而不是 finished 事件，避免失败或取消的调用被漏算。
     model_calls = sum(1 for event_type in event_types if event_type == "llm_call_started")
     tool_calls = sum(1 for event_type in event_types if event_type == "tool_call_started")
     subagent_calls = sum(1 for metadata in metadata_list if metadata.get("tool_name") == "task")
@@ -55,6 +60,7 @@ def diagnose_task(task_id: str) -> dict[str, Any]:
 
 
 def _slowest_events(events: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    """从 trace 中挑出耗时最高的阶段。"""
     candidates = []
     for event in events:
         metadata = event.get("metadata") or {}
@@ -73,6 +79,7 @@ def _slowest_events(events: list[dict[str, Any]], limit: int = 5) -> list[dict[s
 
 
 def _recommendations(events: list[dict[str, Any]], model_calls: int, tool_calls: int, subagent_calls: int, critic_events: list[dict[str, Any]]) -> list[str]:
+    """根据简单工程规则生成优化建议。"""
     recommendations: list[str] = []
     event_types = [str(event.get("event_type") or "") for event in events]
     metadata_list = [event.get("metadata") or {} for event in events]
@@ -96,6 +103,7 @@ def _recommendations(events: list[dict[str, Any]], model_calls: int, tool_calls:
 
 
 def _sum_latency(events: list[dict[str, Any]]) -> float:
+    """累加一组事件的 latency_ms，兼容 latency 在 metadata 中的旧事件。"""
     total = 0.0
     for event in events:
         metadata = event.get("metadata") or {}
@@ -104,6 +112,7 @@ def _sum_latency(events: list[dict[str, Any]]) -> float:
 
 
 def _stage_name(event: dict[str, Any]) -> str:
+    """生成可读阶段名，优先使用 metadata 中的具体 stage/step/tool/workflow。"""
     metadata = event.get("metadata") or {}
     event_type = str(event.get("event_type") or "unknown")
     for key in ("stage", "step_name", "tool_name", "workflow_name"):
@@ -113,6 +122,7 @@ def _stage_name(event: dict[str, Any]) -> str:
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
+    """解析 ISO 时间戳；非法值返回 None，避免单条坏 trace 影响整个诊断。"""
     if not value:
         return None
     try:

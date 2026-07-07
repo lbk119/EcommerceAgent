@@ -18,7 +18,7 @@
 - AI 对话体验：前端拆成左侧对话和右侧 Agent 状态面板，助手消息展示答案、可折叠分析过程、状态、耗时、来源；WebSocket 事件按“接收问题、识别意图、读取店铺数据、命中工作流、生成建议、质量检查、写入结果、完成”等阶段聚合，默认只展示当前阶段和最近关键事件。
 - AI 对话并发：同一 `conversationId` 内允许多个后台任务并行运行，生命周期隔离改由唯一 `task_id` 承担；用户在长任务运行时可以继续提交下一问，不再因为同会话已有任务而返回 409。
 - AI 对话性能：高频经营问题优先走 `workflow_fast`，SQL workflow 节点使用并行读取，deterministic draft 会先通过 `assistant_delta` 推给前端，LLM 只做快速润色；`AI_CHAT_MODEL_PROFILE=fast`、`AI_CHAT_LLM_TIMEOUT_SECONDS=8`、`AI_CHAT_LLM_MAX_RETRIES=1`、`AI_CHAT_TOTAL_TARGET_SECONDS=15`、`AI_CHAT_DEEPAGENT_ENABLED=false` 用于约束 AI Chat 的成本和等待时间。
-- AI 对话分类：`classify_task()` 只吃 raw user question，入队 payload 同时保留 `raw_user_question`、`classification` 和 `agent_query`；包装 prompt 不再参与分类，避免“天气”被包装词里的库存、商品、活动误判成业务 workflow。
+- AI 对话规划：HTTP 受理阶段用 PlannerAgent 同步 fallback 生成轻量 `task_plan`，入队 payload 保留 `raw_user_question`、`task_plan` 和 `agent_query`；包装 prompt 不再参与规划，避免“天气”被包装词里的库存、商品、活动误判成业务 workflow。
 - AI 对话持久化：新增 MySQL `ai_chat_conversations`、`ai_chat_messages`、`ai_chat_runs`；完成消息保存 `structured_json` 并返回 `structuredResult`，刷新后可从后端恢复历史消息、任务状态和已完成结构化结果。
 - AgentRuntime profiles：新增 `realtime`、`standard`、`deep` 三档运行时。`realtime` 由 ChatAgentRuntime 承接，不构建 DeepAgent；`standard` 用 slim DeepAgent + workflow 优先 + 受控预算；`deep` 才允许完整 DeepAgent、可选知识库/网络搜索、Critic、Memory、Evolution。
 - AgentRuntime budget：新增模型/工具/subagent/wall time 硬预算，默认 realtime 为 15s/1 model/3 tools/0 subagents，standard 为 45s/2 models/6 tools/1 subagent，deep 为 180s/6 models/12 tools/3 subagents；超预算会写入 `budget_exceeded` trace 并返回阶段性结果。

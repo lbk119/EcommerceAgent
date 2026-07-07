@@ -10,7 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from agent.core.agent_spec import AgentSpec
 from agent.core.tool_registry import tool_registry
-from agent.planning.task_classifier import TaskClassification, classify_task
+from agent.planning.planner_agent import planner_agent
+from agent.planning.schemas import TaskPlan
 
 
 CRITIC_KEYWORDS = (
@@ -26,6 +27,7 @@ CRITIC_KEYWORDS = (
     "异常分析",
 )
 
+# 关键词到治理任务类型的映射。这里用于解释“为什么需要 Critic”，不是最终业务分类器。
 TASK_TYPE_KEYWORDS = {
     "business_report": ("经营日报", "日报", "周报", "月报", "经营分析"),
     "database_change": ("sql", "写入", "更新", "插入", "删除", "改库", "入库"),
@@ -63,14 +65,18 @@ def evaluate_critic_policy(
     *,
     agent_specs: Optional[Iterable[AgentSpec]] = None,
     tool_calls: Optional[Iterable[Dict[str, Any]]] = None,
-    task_classification: Optional[TaskClassification] = None,
+    task_plan: Optional[TaskPlan] = None,
 ) -> CriticPolicyDecision:
-    """根据治理字段、任务类型、工具风险和用户请求关键词判断是否需要 Critic。"""
-    task_classification = task_classification or classify_task(query)
+    """根据治理字段、任务类型、工具风险和用户请求关键词判断是否需要 Critic。
+
+    决策来源越集中，后续越容易在前端或审计日志中解释：本次 Critic 是因为用户请求、任务分类、
+    AgentSpec 还是高风险工具触发。
+    """
+    task_plan = task_plan or planner_agent.plan(query)
     compact_query = query.lower().replace(" ", "")
     reasons: List[str] = []
     matched_keywords = [keyword for keyword in CRITIC_KEYWORDS if keyword.lower() in compact_query]
-    task_types = _match_task_types(compact_query, task_classification)
+    task_types = _match_task_types(compact_query, task_plan)
     agent_names = _match_critic_required_agents(agent_specs or [], tool_calls or [])
     high_risk_tools = _match_high_risk_tools(tool_calls or [])
 
@@ -78,8 +84,8 @@ def evaluate_critic_policy(
         reasons.append("user_request_keyword")
     if task_types:
         reasons.append("task_type")
-    if task_classification.requires_critic and "task_classifier" not in reasons:
-        reasons.append("task_classifier")
+    if task_plan.critic_required and "task_plan" not in reasons:
+        reasons.append("task_plan")
     if agent_names:
         reasons.append("agent_spec_critic_required")
     if high_risk_tools:
@@ -95,17 +101,19 @@ def evaluate_critic_policy(
     )
 
 
-def _match_task_types(compact_query: str, task_classification: TaskClassification) -> List[str]:
+def _match_task_types(compact_query: str, task_plan: TaskPlan) -> List[str]:
+    """合并关键词命中的治理任务类型和 PlannerAgent 输出的业务任务类型。"""
     task_types: List[str] = []
     for task_type, keywords in TASK_TYPE_KEYWORDS.items():
         if any(keyword.lower().replace(" ", "") in compact_query for keyword in keywords):
             task_types.append(task_type)
-    if task_classification.task_type != "general_chat":
-        task_types.append(task_classification.task_type)
+    if task_plan.primary_task_type != "general_business_chat":
+        task_types.append(task_plan.primary_task_type)
     return sorted(set(task_types))
 
 
 def _match_critic_required_agents(agent_specs: Iterable[AgentSpec], tool_calls: Iterable[Dict[str, Any]]) -> List[str]:
+    """根据已观察到的工具/子 Agent 调用，找出声明 critic_required 的 Agent。"""
     observed_tools = {str(call.get("tool_name", "")) for call in tool_calls}
     observed_subagents = {
         str(call.get("args", {}).get("subagent_type", ""))
@@ -122,12 +130,14 @@ def _match_critic_required_agents(agent_specs: Iterable[AgentSpec], tool_calls: 
 
 
 def _match_high_risk_tools(tool_calls: Iterable[Dict[str, Any]]) -> List[str]:
+    """识别高风险或天然需要人工审核的工具调用。"""
     high_risk_tools: List[str] = []
     for call in tool_calls:
         tool_name = str(call.get("tool_name", ""))
         risk = str(call.get("risk", "")).lower()
         requires_human_approval = bool(call.get("requires_human_approval"))
         if not risk and tool_name in tool_registry._specs:
+            # 兼容旧 trace：如果事件里没有风险字段，就回查 ToolRegistry 当前元数据。
             spec = tool_registry.get_spec(tool_name)
             risk = spec.risk.lower()
             requires_human_approval = spec.requires_human_approval

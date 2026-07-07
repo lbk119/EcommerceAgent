@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent.planning.schemas import TaskPlan
 from agent.workflows.business_metrics import BusinessTimeRange, parse_business_time_range
 
 
@@ -22,14 +23,23 @@ class PlanStep:
     critical: bool = False
     timeout_seconds: float | None = None
     params: dict[str, Any] = field(default_factory=dict)
+    step_id: str = ""
+    expert: str = "data_expert"
+    depends_on: tuple[str, ...] = ()
+    can_parallel: bool = True
 
     def to_dict(self) -> dict[str, Any]:
+        """转换为 trace/API 可序列化结构。"""
         return {
+            "step_id": self.step_id or self.name,
             "name": self.name,
             "label": self.label,
             "critical": self.critical,
             "timeout_seconds": self.timeout_seconds,
             "params": self.params,
+            "expert": self.expert,
+            "depends_on": list(self.depends_on),
+            "can_parallel": self.can_parallel,
         }
 
 
@@ -56,6 +66,7 @@ class ExecutionPlan:
 
 
 PLAN_REGISTRY: dict[str, tuple[PlanStep, ...]] = {
+    # 每个 task_type 对应一组互不依赖的数据读取 step，因此可以一次 plan 后并行执行。
     "inventory_analysis": (
         PlanStep("query_inventory_risks", "库存风险", critical=True),
         PlanStep("query_inventory_velocity", "销量与补货速度", critical=True),
@@ -97,6 +108,7 @@ PLAN_REGISTRY: dict[str, tuple[PlanStep, ...]] = {
 
 
 OUTPUT_REQUIREMENTS: dict[str, str] = {
+    # Reducer/可选 fast polish 使用这些要求约束输出，避免结构化结果丢掉关键业务字段。
     "inventory_analysis": "输出库存分析，必须包含优先处理 SKU、低于安全库存原因、销量速度、补货动作和缺失数据。",
     "inventory_warning": "输出库存预警报告，必须包含风险 SKU、库存/安全库存、优先级和明确动作建议。",
     "campaign_review": "输出活动复盘，必须覆盖流量、成交、ROI、退款或库存风险，并给出下一轮优化动作。",
@@ -109,6 +121,43 @@ OUTPUT_REQUIREMENTS: dict[str, str] = {
 
 class PlanRegistry:
     """规则 Planner。"""
+
+    def from_task_plan(self, task_plan: TaskPlan) -> ExecutionPlan | None:
+        """把 PlannerAgent 的 TaskPlan 转换为可执行 ExecutionPlan。
+
+        只接收 deterministic/hybrid 且 step.name 存在于本执行器支持集合中的节点；Planner 给出的
+        report/reducer 类型综合节点不会进入执行器，而由 Reducer 统一完成。
+        """
+        if task_plan.execution_mode not in {"deterministic_dag", "hybrid_plan"}:
+            return None
+        executable_names = _executable_step_names()
+        steps: list[PlanStep] = []
+        for planner_step in task_plan.steps:
+            if planner_step.name not in executable_names:
+                continue
+            steps.append(PlanStep(
+                name=planner_step.name,
+                label=planner_step.description or _label_for_step(planner_step.name),
+                critical=planner_step.critical,
+                timeout_seconds=planner_step.timeout_seconds,
+                params=dict(planner_step.input_schema or {}),
+                step_id=planner_step.step_id,
+                expert=planner_step.expert,
+                depends_on=tuple(planner_step.depends_on),
+                can_parallel=planner_step.can_parallel,
+            ))
+        if not steps:
+            return None
+        time_range = parse_business_time_range(task_plan.raw_query)
+        workflow_name = task_plan.intent.primary_goal or steps[0].name
+        return ExecutionPlan(
+            task_type=workflow_name,
+            workflow_name=workflow_name,
+            steps=tuple(steps),
+            time_range=time_range,
+            output_requirements=task_plan.expected_output,
+            metadata={"planner": "planner_agent", "plan_version": "2026-07-07", "task_plan": task_plan.to_dict()},
+        )
 
     def plan(self, task_type: str, query: str, *, workflow_name: str = "") -> ExecutionPlan | None:
         """按 task_type/workflow_name 一次性生成固定 DAG。
@@ -130,3 +179,15 @@ class PlanRegistry:
             output_requirements=OUTPUT_REQUIREMENTS.get(key) or OUTPUT_REQUIREMENTS.get(resolved_task_type, "输出结构化经营分析结论。"),
             metadata={"planner": "rule_registry", "plan_version": "2026-07-06"},
         )
+
+
+def _executable_step_names() -> set[str]:
+    return {step.name for steps in PLAN_REGISTRY.values() for step in steps}
+
+
+def _label_for_step(step_name: str) -> str:
+    for steps in PLAN_REGISTRY.values():
+        for step in steps:
+            if step.name == step_name:
+                return step.label
+    return step_name

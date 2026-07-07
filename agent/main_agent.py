@@ -36,6 +36,7 @@ def build_main_agent(profile: str = "deep"):
         raise ValueError("realtime profile 不构建 DeepAgent，请使用 ChatAgentRuntime。")
     subagents_list, subagent_specs = _subagents_for_profile(runtime_profile.name)
     checkpointer = _checkpointer_for_profile(runtime_profile.name)
+    # deep profile 使用 deep 模型；standard profile 使用 standard 模型，避免普通后台任务误走深度模型。
     model = get_deep_model() if runtime_profile.name == "deep" else get_standard_model()
     return create_deep_agent(
         model=model,
@@ -65,7 +66,11 @@ def reload_agent_policy():
 
 
 def _subagents_for_profile(profile: str):
-    """按 profile 裁剪 subagent；standard 默认只保留可预算约束的数据库助手，deep 才允许可选外部搜索。"""
+    """按 profile 裁剪 subagent。
+
+    standard 默认只保留可预算约束的数据库助手；deep 才允许通过环境变量开启知识库/网络搜索等较重能力。
+    这样可以把商业化热路径控制在可预测成本内，同时保留显式深度任务的扩展空间。
+    """
     from agent.sub_agents.database_query_agent import database_query_agent, database_query_agent_spec
 
     subagents = [database_query_agent]
@@ -73,6 +78,7 @@ def _subagents_for_profile(profile: str):
     if profile == "deep":
         import os
 
+        # 可选深度子 Agent 延迟 import，避免 FastAPI 启动和 standard/realtime 热路径加载重依赖。
         if os.getenv("DEEP_AGENT_ENABLE_KNOWLEDGE_BASE", "false").lower() in {"1", "true", "yes", "on"}:
             from agent_extensions.deep_subagents.knowledge_base_agent import knowledge_base_agent, knowledge_base_agent_spec
 
@@ -104,6 +110,7 @@ async def run_deep_agent(
     user_id="local_user",
     shop_id="default_shop",
     runtime_profile="full",
+    task_plan_override=None,
 ):
     """
     FastAPI 后台任务调用的稳定入口。
@@ -112,6 +119,8 @@ async def run_deep_agent(
     Critic retry、记忆写入和 trace 收尾都由 AgentRuntime 统一编排。
     """
     print(f"当前会话的main_agent开始执行了！ conversation_id:{conversation_id} task_id:{task_id}")
+    # 这里仍然按 runtime_profile 获取 Agent 图，但真正的阶段编排已经下沉到 AgentRuntime。
+    # 保持该兼容入口可以让 API 层、任务队列和旧测试脚本不需要同步改调用方式。
     agent, subagent_specs = get_deep_agent(runtime_profile)
     runtime = AgentRuntime(agent, subagent_specs)
     return await runtime.run(
@@ -122,4 +131,5 @@ async def run_deep_agent(
         user_id=user_id,
         shop_id=shop_id,
         runtime_profile=runtime_profile,
+        task_plan_override=task_plan_override,
     )

@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from agent.observability.trace_reader import build_task_timeline
 from agent.observability.tracer import tracer
-from agent.planning.task_classifier import classify_task
+from agent.planning.planner_agent import planner_agent
 from api.routes.helpers import gateway_identity, requested_shop
 from api.services.ai_chat_service import create_chat_run, fail_chat_run, get_message, get_run_by_task, list_conversations, list_messages
 from api.task_queue import task_queue
@@ -42,7 +42,9 @@ async def chat(payload: dict, request: Request):
 
     conversation_id = str(payload.get("conversationId") or uuid.uuid4())
     task_id = str(uuid.uuid4())
-    classification = classify_task(user_content)
+    task_plan = planner_agent.plan(user_content, profile="realtime")
+    task_plan_payload = task_plan.to_lightweight_dict()
+    intent = task_plan.primary_task_type
     agent_query = build_agent_chat_query(user_content)
     run = create_chat_run(
         tenant_id=tenant_id,
@@ -50,7 +52,7 @@ async def chat(payload: dict, request: Request):
         user_id=user_id,
         conversation_id=conversation_id,
         user_content=user_content,
-        intent=classification.task_type,
+        intent=intent,
         task_id=task_id,
     )
     metadata = {
@@ -60,9 +62,9 @@ async def chat(payload: dict, request: Request):
         "user_id": user_id,
         "source": "ai_chat",
         "message_id": run["message_id"],
-        "intent": classification.task_type,
+        "intent": intent,
         "raw_user_question": user_content,
-        "classification": classification.to_dict(),
+        "task_plan": task_plan_payload,
         "runtime_profile": "realtime",
         "max_runtime_seconds": int(os.getenv("AI_CHAT_MAX_RUNTIME_SECONDS", "180")),
     }
@@ -78,7 +80,7 @@ async def chat(payload: dict, request: Request):
         conversation_id=conversation_id,
         agent_name="ai_chat",
         latency_ms=round((time.perf_counter() - started_at) * 1000, 2),
-        metadata={"stage": "queued", "status": "running", "intent": classification.task_type, "message_id": run["message_id"]},
+        metadata={"stage": "queued", "status": "running", "intent": intent, "message_id": run["message_id"], "task_plan": task_plan_payload},
     )
     await task_queue.enqueue(
         {
@@ -91,9 +93,9 @@ async def chat(payload: dict, request: Request):
             "user_id": user_id,
             "source": "ai_chat",
             "message_id": run["message_id"],
-            "intent": classification.task_type,
+            "intent": intent,
             "raw_user_question": user_content,
-            "classification": classification.to_dict(),
+            "task_plan": task_plan_payload,
             "agent_query": agent_query,
             "runtime_profile": "realtime",
             "model_profile": os.getenv("AI_CHAT_MODEL_PROFILE", "fast"),
@@ -110,7 +112,7 @@ async def chat(payload: dict, request: Request):
         "status": "running",
         "source": "agent",
         "wsThreadId": conversation_id,
-        "intent": classification.task_type,
+        "intent": intent,
         "acceptedLatencyMs": accepted_latency_ms,
         "message": {
             "id": run["message_id"],
@@ -120,7 +122,7 @@ async def chat(payload: dict, request: Request):
             "status": "running",
             "taskId": task_id,
             "conversationId": conversation_id,
-            "intent": classification.task_type,
+            "intent": intent,
         },
     }
 
@@ -202,3 +204,5 @@ def build_agent_chat_query(user_question: str) -> str:
 - SQL 只能作为 workflow/tool 的数据源，最终回答必须由 AgentRuntime 控制输出。
 - 如果没有接入平台行情、搜索热度或外部网络数据，请明确说明，不要假装知道全网行情。
 """.strip()
+
+

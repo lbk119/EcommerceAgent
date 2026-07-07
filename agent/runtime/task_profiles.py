@@ -15,7 +15,11 @@ from agent.runtime.profiles import normalize_runtime_profile
 
 @dataclass(frozen=True)
 class TaskExecutionProfile:
-    """固定 DAG 执行 profile。"""
+    """固定 DAG 执行 profile。
+
+    step_timeout_seconds 控制单个并行节点；global_timeout_seconds 控制整个计划；polish_timeout_seconds
+    控制可选 fast model 润色。三者分开可以避免单个慢 SQL 拖垮整体任务。
+    """
 
     name: str
     step_timeout_seconds: float
@@ -58,10 +62,12 @@ def get_task_execution_profile(profile: str | None) -> TaskExecutionProfile:
 
 
 def _float_env(name: str, default: float) -> float:
+    """读取浮点环境变量。"""
     return float(os.getenv(name, str(default)))
 
 
 def _bool_env(name: str, default: bool) -> bool:
+    """读取布尔环境变量，兼容 1/true/yes/on。"""
     value = os.getenv(name)
     if value is None:
         return default

@@ -12,7 +12,8 @@ from typing import Any
 
 from agent.memory.schema import MemoryIdentity
 from agent.observability.tracer import tracer
-from agent.planning.task_classifier import TaskClassification, classify_task
+from agent.planning.planner_agent import planner_agent
+from agent.planning.schemas import TaskPlan
 from agent.runtime.execution_result import ExecutionResult
 from agent.security.prompt_guard import inspect_user_prompt
 from agent.security.redaction import redact_secrets
@@ -40,7 +41,6 @@ async def run_chat_agent(payload: dict[str, Any]) -> str:
     try:
         return await _run_chat_agent_inner(
             raw_question=raw_question,
-            classification=_classification_from_payload(payload) or classify_task(raw_question),
             conversation_id=conversation_id,
             task_id=task_id,
             message_id=message_id,
@@ -56,7 +56,6 @@ async def run_chat_agent(payload: dict[str, Any]) -> str:
 async def _run_chat_agent_inner(
     *,
     raw_question: str,
-    classification: TaskClassification,
     conversation_id: str,
     task_id: str,
     message_id: str,
@@ -64,7 +63,13 @@ async def _run_chat_agent_inner(
     user_id: str,
     shop_id: str,
 ) -> str:
+    """AI Chat 的真实执行主体。
+
+    该函数只跑轻量可控链路：安全检查 -> 分类 trace -> 固定 DAG workflow -> 结果汇总。
+    它不会同步启动 DeepAgent，也不会写长期记忆，保证前端聊天可以快速完成或明确给出能力边界。
+    """
     stage_started = time.perf_counter()
+    # 先把安全检查写入 trace，前端 timeline 可以看到任务不是“卡住”，而是在做 prompt guard。
     tracer.emit("prompt_guard_started", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="chat_prompt_guard", metadata={"stage": "prompt_guard", "status": "running"})
     guard_result = inspect_user_prompt(raw_question)
     tracer.emit(
@@ -76,14 +81,22 @@ async def _run_chat_agent_inner(
         latency_ms=round((time.perf_counter() - stage_started) * 1000, 2),
         metadata={"stage": "prompt_guard", "status": "completed", "prompt_guard": guard_result.to_metadata()},
     )
-
+    task_plan = await planner_agent.plan_async(guard_result.sanitized_query, profile="realtime", context={"tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id}, trace_id=task_id, task_id=task_id, conversation_id=conversation_id)
+    tracer.emit(
+        "runtime_stage_completed",
+        trace_id=task_id,
+        task_id=task_id,
+        conversation_id=conversation_id,
+        agent_name="chat_agent_runtime",
+        metadata={"stage": "planner_acceptance_fallback", "status": "completed", "plan_id": task_plan.plan_id},
+    )
     tracer.emit(
         "task_classified",
         trace_id=task_id,
         task_id=task_id,
         conversation_id=conversation_id,
-        agent_name="chat_task_classifier",
-        metadata={"stage": "task_classification", "status": "completed", "task_classification": classification.to_dict(), "classified_from": "raw_user_question"},
+        agent_name="chat_planner_agent",
+        metadata={"stage": "task_planning", "status": "completed", **task_plan.to_trace_metadata()},
     )
     tracer.emit(
         "context_prepared",
@@ -99,22 +112,23 @@ async def _run_chat_agent_inner(
         task_id=task_id,
         conversation_id=conversation_id,
         agent_name="chat_agent_runtime",
-        metadata={"query": redact_secrets(guard_result.sanitized_query), "task_classification": classification.to_dict(), "runtime_profile": "chat_lightweight"},
+        metadata={"query": redact_secrets(guard_result.sanitized_query), **task_plan.to_trace_metadata(include_plan=False), "runtime_profile": "chat_lightweight"},
     )
 
-    if classification.preferred_workflow != "deterministic_dag":
-        final_text = _boundary_answer(guard_result.sanitized_query, classification)
+    if task_plan.execution_mode not in {"deterministic_dag", "hybrid_plan", "boundary"}:
+        # AI Chat 只同步处理确定性经营 workflow。其它问题给边界说明，不在用户等待时拉起 DeepAgent。
+        final_text = _boundary_answer(guard_result.sanitized_query, task_plan)
         monitor.emit_assistant_delta(task_id=task_id, conversation_id=conversation_id, message_id=message_id, delta=final_text)
         tracer.emit("agent_finished", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="chat_agent_runtime", metadata={"stage": "agent_finished", "status": "completed", "source": "boundary"})
         return final_text
 
     async def no_deepagent_fallback(_: str) -> str:
         # ChatAgentRuntime 不允许同步拉起 DeepAgent；未覆盖任务应给边界说明或由显式后台任务承接。
-        return _boundary_answer(guard_result.sanitized_query, classification)
+        return _boundary_answer(guard_result.sanitized_query, task_plan)
 
     result: ExecutionResult = await WorkflowRunner().run_or_fallback(
         query=guard_result.sanitized_query,
-        classification=classification,
+        task_plan=task_plan,
         trace_id=task_id,
         task_id=task_id,
         conversation_id=conversation_id,
@@ -129,17 +143,7 @@ async def _run_chat_agent_inner(
     return result.to_final_result()
 
 
-def _classification_from_payload(payload: dict[str, Any]) -> TaskClassification | None:
-    data = payload.get("classification")
-    if not isinstance(data, dict):
-        return None
-    task_type = str(data.get("task_type") or "general_business_chat")
-    risk = str(data.get("risk") or "low")
-    preferred_workflow = str(data.get("preferred_workflow") or "deepagent")
-    return TaskClassification(task_type=task_type, risk=risk, requires_critic=bool(data.get("requires_critic", False)), preferred_workflow=preferred_workflow)
-
-
-def _boundary_answer(question: str, classification: TaskClassification) -> str:
+def _boundary_answer(question: str, task_plan: TaskPlan) -> str:
     """普通闲聊或未接入能力不进 DeepAgent，先明确边界，再给可继续的业务入口。"""
     if any(keyword in question for keyword in ("天气", "气温", "下雨", "空气质量")):
         return (
@@ -151,7 +155,7 @@ def _boundary_answer(question: str, classification: TaskClassification) -> str:
         )
     return (
         "## 当前能力边界\n"
-        f"这条问题被识别为 `{classification.task_type}`，当前 AI Chat 只同步执行高频经营 workflow。\n\n"
+        f"这条问题被 PlannerAgent 规划为 `{task_plan.primary_task_type}`，当前 AI Chat 只同步执行高频经营 workflow。\n\n"
         "## 建议问法\n"
         "- 最近爆品有哪些？\n"
         "- 哪个商品最值得优化？\n"

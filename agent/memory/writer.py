@@ -1,3 +1,12 @@
+"""长期记忆写入编排。
+
+任务结束后，result_pipeline 会把脱敏后的 query/result/lessons 传到这里。writer 负责：
+- 调 extractor 生成候选；
+- 按执行质量做 skip/degrade/write/review；
+- 写入 MySQLMemoryStore 或人工审核表；
+- 记录 memory_* task_event，方便审计和排障。
+"""
+
 from typing import Dict, List
 
 from agent.memory.evolution_memory import append_task_event
@@ -7,6 +16,7 @@ from agent.memory.store import get_memory_store
 
 
 def write_memories_after_task(identity: MemoryIdentity, task_query: str, final_result: str, lessons: list[str] = None, execution_metadata: dict | None = None) -> Dict[str, int]:
+    """任务完成后的长期记忆写入入口。"""
     execution_metadata = execution_metadata or {}
     candidates = extract_memory_candidates(task_query, final_result, lessons or [])
     if not candidates:
@@ -24,12 +34,14 @@ def write_memories_after_task(identity: MemoryIdentity, task_query: str, final_r
             _append_candidate_quality_event(identity, candidate, execution_metadata, quality_action["reason"])
             continue
         if quality_action["action"] == "degrade":
+            # workflow/Critic 存在质量问题时，工具经验可以保留但降低置信度，避免误导后续任务。
             degraded += 1
             candidate.confidence = min(candidate.confidence, 0.45)
             if quality_action["reason"] not in candidate.tags:
                 candidate.tags.append(quality_action["reason"])
             _append_candidate_quality_event(identity, candidate, execution_metadata, quality_action["reason"], degraded=True)
         if candidate.requires_review:
+            # 高风险记忆先进入审核队列，人工批准后才会写入 agent_memories。
             review += 1
             review_id = store.create_review(identity, candidate)
             append_task_event("memory_review_required", identity.task_id or identity.conversation_id, {
@@ -71,6 +83,7 @@ def _memory_quality_action(memory_type: str, execution_metadata: dict) -> dict:
 
 
 def _append_candidate_quality_event(identity: MemoryIdentity, candidate, execution_metadata: dict, reason: str, degraded: bool = False) -> None:
+    """记录候选被跳过或降级的原因，便于诊断记忆为什么没有写入。"""
     append_task_event("memory_candidate_degraded" if degraded else "memory_candidate_skipped", identity.task_id or identity.conversation_id, {
         "reason": reason,
         "memory_type": candidate.memory_type,

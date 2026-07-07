@@ -48,9 +48,14 @@ def decide_tool_permission(
     risk: str = "low",
     actor: str = "unknown_agent",
 ) -> PermissionDecision:
-    """计算工具调用是否被允许，不产生副作用。"""
+    """计算工具调用是否被允许，不产生副作用。
+
+    这个函数只返回决策结果，不写 trace、不抛异常，便于单元测试和未来“预检工具调用”。
+    真正的拦截逻辑在 assert_tool_allowed 中完成。
+    """
     required = list(required_permissions or [])
     granted = list(granted_permissions or [])
+    # 当前策略要求工具声明的权限全部满足；后续可在这里扩展 role/risk/approval 等更细规则。
     missing = sorted(set(required) - set(granted))
     if not permission_enforcement_enabled():
         return PermissionDecision(True, tool_name, actor, required, granted, [], risk, "permission enforcement disabled")
@@ -73,6 +78,7 @@ def assert_tool_allowed(
     """
     decision = decide_tool_permission(tool_name, required_permissions, granted_permissions, risk, actor)
     context = current_runtime_context()
+    # 不论允许还是拒绝都写 trace，方便排查“为什么某个工具没有执行”。
     tracer.emit(
         "tool_permission_checked",
         trace_id=context.trace_id,
@@ -90,6 +96,7 @@ def assert_tool_allowed(
         },
     )
     if not decision.allowed:
+        # 直接抛出 PermissionDenied，让 LangChain/AgentRuntime 按普通工具异常处理并进入 trace。
         raise PermissionDenied(
             f"工具 {tool_name} 权限不足：缺少 {', '.join(decision.missing_permissions)}，调用方 {actor}"
         )

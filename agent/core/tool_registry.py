@@ -25,7 +25,7 @@ class ToolSpec:
 
     字段说明：
     - name: 工具稳定标识。AgentSpec、权限策略、审计事件都用这个名字引用工具。
-        - tool_factory: 懒加载实际 LangChain tool 对象的工厂。catalog、权限和 Critic policy 只读元数据，
+    - tool_factory: 懒加载实际 LangChain tool 对象的工厂。catalog、权限和 Critic policy 只读元数据，
             不应该因为导入 ToolRegistry 就初始化 LLM、RAGFlow 或数据库 workflow。
     - category: 工具类别，用于前端分组、审计筛选和 Critic 校验策略选择。
     - risk: 风险等级。建议使用 low / medium / high，后续权限引擎可按等级加严。
@@ -94,6 +94,11 @@ class ToolRegistry:
         return self._guarded_tools[cache_key]
 
     def _build_guarded_tool(self, spec: ToolSpec, granted_permissions: List[str], actor: str):
+        """构造真正交给 DeepAgents 的受保护工具。
+
+        StructuredTool.from_function 会复用原工具的名称、描述、参数 schema 和 return_direct 设置；
+        我们只在执行函数外包一层权限检查，尽量不破坏 LangChain 对 tool schema 的推断。
+        """
         from langchain_core.tools import StructuredTool
 
         original_tool = self.get(spec.name)
@@ -105,10 +110,12 @@ class ToolRegistry:
         async_func = getattr(original_tool, "coroutine", None)
 
         def guarded_func(*args, **kwargs):
+            # 权限检查放在每次实际调用前，而不是挂载工具时，避免缓存绕过权限变化。
             check_permission()
             return sync_func(*args, **kwargs)
 
         async def guarded_coroutine(*args, **kwargs):
+            # async 工具同样在执行前检查权限，保证同步/异步路径治理一致。
             check_permission()
             return await async_func(*args, **kwargs)
 

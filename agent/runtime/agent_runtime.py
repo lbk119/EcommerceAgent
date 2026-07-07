@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from agent.core.agent_spec import AgentSpec
 from agent.observability.tracer import tracer
-from agent.planning.task_classifier import TaskClassification, classify_task
+from agent.planning.planner_agent import planner_agent
+from agent.planning.schemas import TaskPlan
 from agent.runtime.profiles import get_runtime_profile, normalize_runtime_profile
 from agent.security.prompt_guard import PromptGuardResult, inspect_user_prompt
 from agent.security.redaction import redact_secrets
@@ -47,7 +48,7 @@ class AgentRuntime:
         user_id: str = "local_user",
         shop_id: str = "default_shop",
         runtime_profile: str = "full",
-        classification_override: TaskClassification | None = None,
+        task_plan_override: TaskPlan | None = None,
     ) -> str:
         """执行一次完整任务，并保持 run_deep_agent 原有异常语义。"""
         task_id = task_id or str(uuid.uuid4())
@@ -55,16 +56,22 @@ class AgentRuntime:
 
         try:
             runtime_profile_config = get_runtime_profile(runtime_profile)
-            context, guard_result, classification = self.prepare_context(task_query, conversation_id, task_id, tenant_id, user_id, shop_id, classification_override=classification_override)
+            # prepare_context 会完成 prompt guard、任务分类、工作目录和 ContextVar 设置。
+            context, guard_result, task_plan = self.prepare_context(task_query, conversation_id, task_id, tenant_id, user_id, shop_id, task_plan_override=task_plan_override, runtime_profile=runtime_profile_config.name)
+            if task_plan_override is None:
+                task_plan = await planner_agent.plan_async(guard_result.sanitized_query, profile=runtime_profile_config.name, context={"tenant_id": tenant_id, "shop_id": shop_id, "user_id": user_id}, trace_id=task_id, task_id=task_id, conversation_id=conversation_id)
+                tracer.emit("task_classified", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="planner_agent", metadata={"stage": "task_planning", "status": "completed", **task_plan.to_trace_metadata(), "planned_from": "planner_agent"})
+            # 预算对象放入 LangGraph config，runner 在模型/工具/子 Agent 调用前从这里取出并计数。
             context.config["configurable"]["runtime_profile"] = runtime_profile_config.name
             context.config["configurable"]["execution_budget"] = runtime_profile_config.budget
             tracer.emit("runtime_budget_configured", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="agent_runtime", metadata=runtime_profile_config.budget.snapshot())
-            self.retrieve_memory(context, classification)
-            execution_result = await self.execute_agent(context, guard_result.sanitized_query, classification)
-            final_result, execution_metadata = await self.run_critic(context, execution_result, classification, runtime_profile=runtime_profile_config.name)
+            self.retrieve_memory(context, task_plan)
+            execution_result = await self.execute_agent(context, guard_result.sanitized_query, task_plan)
+            final_result, execution_metadata = await self.run_critic(context, execution_result, task_plan, runtime_profile=runtime_profile_config.name)
             reflection = self.persist_result(context, final_result, runtime_profile=runtime_profile_config.name)
             self.write_memory(context, final_result, reflection, execution_metadata, runtime_profile=runtime_profile_config.name)
             self.finalize_trace(context)
+            # 返回 FinalResult：字符串兼容旧接口，structured_result 供新 UI 展示。
             return execution_result.to_final_result(final_result)
         except asyncio.CancelledError:
             if context:
@@ -94,6 +101,7 @@ class AgentRuntime:
         finally:
             from agent.runtime.agent_runner import clear_tool_calls_for_task
 
+            # 每个任务结束都清理进程内工具调用摘要和 ContextVar，避免长进程串任务污染。
             clear_tool_calls_for_task(task_id)
             if context:
                 context.cleanup()
@@ -106,12 +114,13 @@ class AgentRuntime:
         tenant_id: str,
         user_id: str,
         shop_id: str,
-        classification_override: TaskClassification | None = None,
-    ) -> tuple[TaskRunContext, PromptGuardResult, TaskClassification]:
+        task_plan_override: TaskPlan | None = None,
+        runtime_profile: str = "standard",
+    ) -> tuple[TaskRunContext, PromptGuardResult, TaskPlan]:
         """
-        prepare_context 阶段：输入安全、任务分类、ContextVar 和工作目录准备。
+        prepare_context 阶段：输入安全、任务规划、ContextVar 和工作目录准备。
 
-        这里故意先分类、再 build_task_context。分类结果会进入 trace；build_task_context 仍负责现有
+        这里故意先规划、再 build_task_context。计划结果会进入 trace；build_task_context 仍负责现有
         文件复制和 LangGraph config，避免一次重构同时改动工具上下文边界。
         """
         from agent.memory.evolution_memory import append_task_event
@@ -119,13 +128,16 @@ class AgentRuntime:
         from agent.runtime.task_context import build_task_context
 
         stage_started = time.perf_counter()
+        # prompt guard 不直接阻断普通业务问题，但会把风险写入 trace，供后续审计/策略升级。
         tracer.emit("prompt_guard_started", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="prompt_guard", metadata={"stage": "prompt_guard", "status": "running"})
         guard_result = inspect_user_prompt(task_query)
         tracer.emit("prompt_guard_finished", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="prompt_guard", latency_ms=round((time.perf_counter() - stage_started) * 1000, 2), metadata={"stage": "prompt_guard", "status": "completed", "prompt_guard": guard_result.to_metadata()})
 
         stage_started = time.perf_counter()
-        classification = classification_override or classify_task(guard_result.sanitized_query)
-        tracer.emit("task_classified", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="task_classifier", latency_ms=round((time.perf_counter() - stage_started) * 1000, 2), metadata={"stage": "task_classification", "status": "completed", "task_classification": classification.to_dict()})
+        # 规划优先基于脱敏/截断后的 query，避免超长输入污染下游 planner。
+        task_plan = task_plan_override or planner_agent.plan(guard_result.sanitized_query, profile=runtime_profile)
+        planner_latency_ms = round((time.perf_counter() - stage_started) * 1000, 2)
+        tracer.emit("task_classified", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="planner_agent", latency_ms=planner_latency_ms, metadata={"stage": "task_planning", "status": "completed", **task_plan.to_trace_metadata(include_plan=False), "planned_from": "deterministic_acceptance_fallback"})
 
         stage_started = time.perf_counter()
         context = build_task_context(guard_result.sanitized_query, conversation_id, task_id, tenant_id, user_id, shop_id)
@@ -137,12 +149,12 @@ class AgentRuntime:
             "tenant_id": tenant_id,
             "user_id": user_id,
             "shop_id": shop_id,
-            "task_classification": classification.to_dict(),
+            "task_plan": task_plan.to_lightweight_dict(),
         })
         monitor._emit("task_started", "任务已进入 AgentRuntime", {
             "task_id": task_id,
             "conversation_id": conversation_id,
-            "task_classification": classification.to_dict(),
+            "task_plan": task_plan.to_lightweight_dict(),
         })
         tracer.emit(
             "agent_started",
@@ -156,12 +168,12 @@ class AgentRuntime:
                 "user_id": user_id,
                 "shop_id": shop_id,
                 "prompt_guard": guard_result.to_metadata(),
-                "task_classification": classification.to_dict(),
+                **task_plan.to_trace_metadata(include_plan=False),
             },
         )
-        return context, guard_result, classification
+        return context, guard_result, task_plan
 
-    def retrieve_memory(self, context: TaskRunContext, classification: TaskClassification) -> None:
+    def retrieve_memory(self, context: TaskRunContext, task_plan: TaskPlan) -> None:
         """
         retrieve_memory 阶段：当前由 build_task_context 内部完成长期记忆召回。
 
@@ -174,14 +186,14 @@ class AgentRuntime:
             task_id=context.task_id,
             conversation_id=context.conversation_id,
             agent_name="main_agent",
-            metadata={"stage": "retrieve_memory", "task_classification": classification.to_dict()},
+            metadata={"stage": "retrieve_memory", **task_plan.to_trace_metadata(include_plan=False)},
         )
 
-    async def execute_agent(self, context: TaskRunContext, sanitized_query: str, classification: TaskClassification) -> ExecutionResult:
+    async def execute_agent(self, context: TaskRunContext, sanitized_query: str, task_plan: TaskPlan) -> ExecutionResult:
         """
         execute_agent 阶段：优先调度 deterministic workflow，未覆盖时回落 DeepAgent。
 
-        这让 task_classifier 的 preferred_workflow 真正影响执行路径；同时保留 DeepAgent fallback，避免
+        这让 PlannerAgent 的 execution_mode 真正影响执行路径；同时保留 DeepAgent fallback，避免
         新增 workflow 覆盖不完整时影响普通任务可用性。
         """
         from agent.runtime.agent_runner import run_agent_with_reflection
@@ -191,11 +203,12 @@ class AgentRuntime:
             return await run_agent_with_reflection(self.agent, query, context.path_instruction, context.config, context.task_id)
 
         runtime_profile = normalize_runtime_profile(context.config.get("configurable", {}).get("runtime_profile", "standard"))
+        # standard 默认不回落完整 DeepAgent，避免 deterministic workflow 失败后拖慢普通后台任务。
         allow_deepagent_fallback = runtime_profile == "deep" or (runtime_profile == "standard" and os.getenv("STANDARD_AGENT_ALLOW_DEEPAGENT_FALLBACK", "false").lower() in {"1", "true", "yes", "on"})
 
         return await WorkflowRunner().run_or_fallback(
             query=sanitized_query,
-            classification=classification,
+            task_plan=task_plan,
             trace_id=context.task_id,
             task_id=context.task_id,
             conversation_id=context.conversation_id,
@@ -204,13 +217,14 @@ class AgentRuntime:
             runtime_profile=runtime_profile,
         )
 
-    async def run_critic(self, context: TaskRunContext, execution_result: ExecutionResult, classification: TaskClassification, *, runtime_profile: str = "full") -> tuple[str, dict]:
+    async def run_critic(self, context: TaskRunContext, execution_result: ExecutionResult, task_plan: TaskPlan, *, runtime_profile: str = "full") -> tuple[str, dict]:
         """run_critic 阶段：执行 Critic policy、Critic 调用和最多一次 fix_instruction 修正。"""
         from agent.runtime.agent_runner import run_agent_with_reflection
         from agent.runtime.result_pipeline import run_critic_stage
         from agent.workflows.workflow_runner import WorkflowRunner
 
         normalized_profile = normalize_runtime_profile(runtime_profile)
+        # 非 deep profile 默认跳过 Critic，把 AI Chat/standard 的热路径成本压低；可用 env 临时开启。
         if normalized_profile != "deep" and os.getenv("AI_CHAT_ENABLE_CRITIC", "false").lower() not in {"1", "true", "yes", "on"}:
             tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "non_deep_profile", "runtime_profile": normalized_profile})
             return execution_result.content, {
@@ -223,9 +237,12 @@ class AgentRuntime:
                 "workflow_failed": execution_result.workflow_failed,
                 "critic_status": "skipped",
                 "runtime_profile": normalized_profile,
+                "plan_id": task_plan.plan_id,
+                "plan_steps_count": len(task_plan.steps),
             }
 
         async def rerun_with_critic_fix(fix_instruction: str) -> str:
+            # workflow 结果优先基于已有结构化数据重合成；DeepAgent 结果才重新走 Agent 反思链路。
             if execution_result.source == "workflow":
                 return await WorkflowRunner().resynthesize_from_result(context.query, execution_result, fix_instruction)
             return await run_agent_with_reflection(self.agent, fix_instruction, context.path_instruction, context.config, context.task_id)
@@ -235,7 +252,7 @@ class AgentRuntime:
             execution_result.content,
             agent_specs=self.agent_specs,
             rerun_with_fix=rerun_with_critic_fix,
-            task_classification=classification,
+            task_plan=task_plan,
         )
         execution_metadata = {
             "source": execution_result.source,
@@ -246,6 +263,8 @@ class AgentRuntime:
             "fallback_reason": execution_result.fallback_reason,
             "workflow_failed": execution_result.workflow_failed,
             "critic_status": critic_stage_result.critic_status,
+            "plan_id": task_plan.plan_id,
+            "plan_steps_count": len(task_plan.steps),
         }
         return critic_stage_result.content, execution_metadata
 

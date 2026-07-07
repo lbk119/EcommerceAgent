@@ -646,9 +646,10 @@ function handleAgentProgressEvent(event: AgentProgressEvent) {
   if (stageUpdate.workflowName) message.workflowName = stageUpdate.workflowName
   if (stageUpdate.deepAgentUsed) message.deepAgentUsed = true
   if (stageUpdate.memoryStatus) message.memoryStatus = stageUpdate.memoryStatus
-  if (eventType === 'task_classified' && typeof data.task_classification === 'object') {
-    const classification = data.task_classification as Record<string, unknown>
-    message.intent = String(classification.task_type || message.intent || '')
+  if (eventType === 'task_classified') {
+    const taskPlan = data.task_plan as Record<string, unknown> | undefined
+    const intent = taskPlan?.intent as Record<string, unknown> | undefined
+    message.intent = String(data.intent || taskPlan?.primary_task_type || intent?.primary_goal || message.intent || '')
   }
   if (eventType === 'workflow_route_decided' && (data.workflow_name || stageUpdate.workflowName)) {
     message.source = 'workflow_fast'
@@ -838,8 +839,9 @@ function stageDisplay(eventType: string, rawStage: string, data: Record<string, 
 }
 
 function intentDetail(data: Record<string, unknown>) {
-  const classification = data.task_classification as Record<string, unknown> | undefined
-  const taskType = classification?.task_type || data.intent || 'general'
+  const taskPlan = data.task_plan as Record<string, unknown> | undefined
+  const intent = taskPlan?.intent as Record<string, unknown> | undefined
+  const taskType = data.intent || taskPlan?.primary_task_type || intent?.primary_goal || 'general'
   return `问题类型：${String(taskType)}`
 }
 

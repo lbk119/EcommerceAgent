@@ -52,7 +52,11 @@ def build_task_timeline(task_id: str) -> Dict[str, Any]:
 
 
 def build_agent_metrics() -> Dict[str, Any]:
-    """汇总 Agent/工具维度的调用次数、失败次数、token 和耗时。"""
+    """汇总 Agent/工具维度的调用次数、失败次数、token 和耗时。
+
+    该函数是运行时健康面板的数据来源。它按 JSONL 全量扫描聚合，适合本地/小规模部署；如果未来
+    trace 量变大，可以把相同返回结构迁移到数据库聚合。
+    """
     agent_counter: Counter[str] = Counter()
     tool_counter: Counter[str] = Counter()
     failures: Counter[str] = Counter()
@@ -68,6 +72,7 @@ def build_agent_metrics() -> Dict[str, Any]:
         agent_name = event.get("agent_name") or "unknown"
         metadata = event.get("metadata") or {}
         stage_name = _stage_name(event)
+        # event_count 统计所有事件，不等同于真实调用次数；调用次数由 tool/llm started 事件单独统计。
         agent_counter[agent_name] += 1
         if metadata.get("tool_name"):
             tool_counter[str(metadata["tool_name"])] += 1
@@ -167,6 +172,7 @@ def build_slow_tasks(limit: int = 20) -> Dict[str, Any]:
 
 
 def _iter_trace_events():
+    """逐行读取 JSONL trace，坏行直接跳过。"""
     path = tracer.path if getattr(tracer, "path", None) else DEFAULT_TRACE_PATH
     if not path.exists():
         return
@@ -182,12 +188,14 @@ def _iter_trace_events():
 
 
 def _avg(values: List[float]) -> float | None:
+    """计算平均值；空列表返回 None 以便 JSON 清楚表达“无样本”。"""
     if not values:
         return None
     return round(sum(values) / len(values), 2)
 
 
 def _percentile(values: List[float], percentile: int) -> float | None:
+    """计算简单百分位值，样本少时使用最近邻索引。"""
     if not values:
         return None
     ordered = sorted(values)
@@ -196,10 +204,12 @@ def _percentile(values: List[float], percentile: int) -> float | None:
 
 
 def _latency_bucket(values: List[float]) -> Dict[str, Any]:
+    """把一组耗时压成 count/avg/p50/p95 的统一结构。"""
     return {"count": len(values), "avg_ms": _avg(values), "p50_ms": _percentile(values, 50), "p95_ms": _percentile(values, 95)}
 
 
 def _slowest_event(events: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """返回单个任务中 latency_ms 最大的事件。"""
     candidates = [event for event in events if event.get("latency_ms") is not None]
     if not candidates:
         return None
@@ -208,6 +218,7 @@ def _slowest_event(events: List[Dict[str, Any]]) -> Dict[str, Any] | None:
 
 
 def _stage_name(event: Dict[str, Any]) -> str:
+    """生成阶段聚合名，保证 metrics 和 slow-task 面板使用同一口径。"""
     metadata = event.get("metadata") or {}
     event_type = str(event.get("event_type") or "unknown")
     for key in ("stage", "step_name", "tool_name", "workflow_name"):
@@ -217,6 +228,7 @@ def _stage_name(event: Dict[str, Any]) -> str:
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
+    """解析 JSONL 中的 ISO 时间戳，兼容 Z 结尾。"""
     if not value:
         return None
     try:

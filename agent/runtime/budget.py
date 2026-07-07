@@ -22,10 +22,16 @@ class BudgetExceededError(RuntimeError):
 
 @dataclass
 class AgentExecutionBudget:
-    """单次 Agent 执行预算。"""
+    """单次 Agent 执行预算。
+
+    预算对象是可变计数器：runner 在模型、工具、子 Agent 调用前登记一次；超过阈值就抛出
+    BudgetExceededError，由上层把已有信息整理成阶段性结果。
+    """
 
     profile: str
+    # 最大端到端运行时间，防止长链路一直占用后台 worker。
     max_wall_time_seconds: float
+    # 模型调用次数上限；realtime/standard 默认很低，deep 才允许更多。
     max_model_calls: int
     max_tool_calls: int
     max_subagent_calls: int
@@ -96,4 +102,5 @@ class AgentExecutionBudget:
         self.subagent_calls += 1
 
     def _raise(self, reason: str) -> None:
+        """统一抛出预算异常，并携带当前预算快照供 trace/诊断使用。"""
         raise BudgetExceededError(reason, self.snapshot())

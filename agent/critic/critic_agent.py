@@ -39,7 +39,11 @@ def critic_required_for_task(query: str) -> bool:
 
 
 async def run_critic(task_query: str, final_result: str, *, trace_id: str, task_id: str, conversation_id: str) -> CriticResult:
-    """调用 critic_model，对最终结果做结构化校验。"""
+    """调用 critic_model，对最终结果做结构化校验。
+
+    Critic 失败时不会让主任务直接失败，而是返回 passed=True 并把错误写入 raw/trace。
+    这样可以避免“审查模型异常”掩盖主 Agent 已经完成的业务结果。
+    """
     tracer.emit("critic_started", trace_id=trace_id, task_id=task_id, conversation_id=conversation_id, agent_name="critic_agent")
     try:
         from agent.llm import get_critic_model
@@ -55,6 +59,7 @@ async def run_critic(task_query: str, final_result: str, *, trace_id: str, task_
             metadata={"passed": result.passed, "issue_count": len(result.issues)},
         )
         if not result.passed:
+            # 未通过时额外发 critic_failed，AgentRuntime 可据此生成修复指令或触发一次 retry。
             tracer.emit(
                 "critic_failed",
                 trace_id=trace_id,
@@ -78,6 +83,10 @@ async def run_critic(task_query: str, final_result: str, *, trace_id: str, task_
 
 
 def _build_critic_prompt(task_query: str, final_result: str) -> str:
+    """构造 Critic 提示词。
+
+    final_result 截断到 8000 字符，避免 Critic 因主答案过长导致上下文成本过高或超限。
+    """
     return f"""
 你是电商运营 Agent 的 Critic，只负责质量校验，不要重写答案。
 
@@ -104,6 +113,7 @@ def _build_critic_prompt(task_query: str, final_result: str) -> str:
 
 
 def _parse_critic_response(response: Any) -> CriticResult:
+    """解析 Critic 的 JSON 响应，兼容 Markdown fenced code block。"""
     content = response.content if hasattr(response, "content") else str(response)
     content = content.strip()
     if content.startswith("```"):

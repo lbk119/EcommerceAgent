@@ -103,6 +103,11 @@ class JsonlTracer:
         self.dropped_count += 1
 
     def _emit_live_progress(self, event: TraceEvent) -> None:
+        """把部分 trace 事件同步转成 WebSocket 进度。
+
+        JSONL 写入和实时进度共用同一份 TraceEvent，但实时推送必须 best-effort：WebSocket 断开、
+        monitor 未初始化或序列化失败都不能影响 Agent 主流程。
+        """
         if not event.conversation_id or event.event_type not in _LIVE_PROGRESS_EVENTS:
             return
         try:
@@ -128,6 +133,7 @@ class JsonlTracer:
             pass
 
 
+# 只有这些事件会推送到前端时间线；过细的内部事件仍会写 JSONL，但不打扰用户界面。
 _LIVE_PROGRESS_EVENTS = {
     "queued",
     "prompt_guard_started",
@@ -139,6 +145,9 @@ _LIVE_PROGRESS_EVENTS = {
     "memory_retrieved",
     "agent_started",
     "runtime_stage_completed",
+    "planner_started",
+    "planner_finished",
+    "planner_failed",
     "plan_execution_started",
     "plan_execution_finished",
     "plan_step_started",
@@ -177,6 +186,7 @@ _LIVE_PROGRESS_EVENTS = {
 
 
 def _live_progress_message(event: TraceEvent) -> str:
+    """把结构化事件转换成前端可读的一句话进度。"""
     metadata = event.metadata or {}
     event_type = event.event_type
     if event_type == "queued":
@@ -186,7 +196,12 @@ def _live_progress_message(event: TraceEvent) -> str:
     if event_type == "prompt_guard_finished":
         return "提示词安全检查完成"
     if event_type == "task_classified":
-        task_type = (metadata.get("task_classification") or {}).get("task_type", metadata.get("intent", "unknown"))
+        task_plan = metadata.get("task_plan") or {}
+        intent = task_plan.get("intent") or {} if isinstance(task_plan, dict) else {}
+        task_type = metadata.get("intent") or task_plan.get("primary_task_type") if isinstance(task_plan, dict) else ""
+        if not task_type and isinstance(intent, dict):
+            task_type = intent.get("primary_goal")
+        task_type = task_type or "unknown"
         return f"已识别问题类型：{task_type}"
     if event_type == "context_prepared":
         return "运行上下文已准备完成"
@@ -197,10 +212,18 @@ def _live_progress_message(event: TraceEvent) -> str:
     if event_type == "memory_retrieved":
         return f"长期记忆召回完成：{metadata.get('count', 0)} 条"
     if event_type == "agent_started":
-        task_type = (metadata.get("task_classification") or {}).get("task_type", "unknown")
+        task_plan = metadata.get("task_plan") or {}
+        task_type = metadata.get("intent") or (task_plan.get("primary_task_type") if isinstance(task_plan, dict) else "") or "unknown"
         return f"Agent 已启动，任务类型：{task_type}"
     if event_type == "runtime_stage_completed":
         return f"运行阶段完成：{metadata.get('stage', 'unknown')}"
+    if event_type == "planner_started":
+        return "PlannerAgent 正在解析需求并生成执行计划"
+    if event_type == "planner_finished":
+        step_count = metadata.get("plan_steps_count") or len((metadata.get("plan") or {}).get("steps", []))
+        return f"PlannerAgent 已生成计划：{step_count} 个步骤"
+    if event_type == "planner_failed":
+        return "PlannerAgent 规划失败，准备使用确定性 fallback"
     if event_type == "plan_execution_started":
         return f"计划已生成，准备并行执行 {metadata.get('step_count', 0)} 个节点"
     if event_type == "plan_execution_finished":

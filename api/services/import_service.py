@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
@@ -142,9 +143,11 @@ def seed_sample_operating_data(tenant_id: str, shop_id: str) -> int:
         refund_rows,
     )
 
+    campaign_618_id = _short_scoped_id(prefix, "campaign", "618 橘子礼盒直播专场", max_len=32)
+    campaign_member_id = _short_scoped_id(prefix, "campaign", "会员日鲜橙满减", max_len=32)
     campaigns = [
-        (tenant_id, shop_id, f"{prefix}_campaign_618", "618 橘子礼盒直播专场", "抖音直播", now - timedelta(days=10), now + timedelta(days=2), 18000.0, "active"),
-        (tenant_id, shop_id, f"{prefix}_campaign_member", "会员日鲜橙满减", "淘宝 / 天猫", now - timedelta(days=6), now + timedelta(days=1), 8000.0, "active"),
+        (tenant_id, shop_id, campaign_618_id, "618 橘子礼盒直播专场", "抖音直播", now - timedelta(days=10), now + timedelta(days=2), 18000.0, "active"),
+        (tenant_id, shop_id, campaign_member_id, "会员日鲜橙满减", "淘宝 / 天猫", now - timedelta(days=6), now + timedelta(days=1), 8000.0, "active"),
     ]
     execute_many(
         """
@@ -277,7 +280,7 @@ def import_uploaded_csv_data(tenant_id: str, shop_id: str, file_path: Path) -> i
         quantity = max(1, _int(row.get("quantity"), 1))
         pay_amount = _float(row.get("pay_amount"), unit_price * quantity)
         campaign_name = row.get("campaign_name") or "CSV 上传活动"
-        campaign_id = f"{prefix}_campaign_{_safe_id(campaign_name, 'csv')}"[:64]
+        campaign_id = _short_scoped_id(prefix, "campaign", campaign_name, max_len=32)
 
         customers[customer_id] = (tenant_id, shop_id, customer_id, f"{customer_id}_unique", 330000 + (index % 9000), row.get("customer_city") or "未知城市", "未知")
         products[product_id] = (tenant_id, shop_id, product_id, row.get("product_name") or product_id, row.get("category") or "uploaded", len(row.get("product_name") or product_id))
@@ -444,6 +447,13 @@ def _safe_id(value: str | None, fallback: str) -> str:
     raw = (value or fallback).strip().lower()
     cleaned = "".join(char if char.isalnum() else "_" for char in raw).strip("_")
     return cleaned or fallback
+
+
+def _short_scoped_id(prefix: str, kind: str, value: str | None, *, max_len: int) -> str:
+    """生成兼容旧 schema 短列宽的稳定业务 ID。"""
+    digest = hashlib.sha1(f"{prefix}:{kind}:{value or ''}".encode("utf-8")).hexdigest()[:10]
+    head = _safe_id(kind, "id")[: max(1, max_len - 11)]
+    return f"{head}_{digest}"[:max_len]
 
 
 def _scope_prefix(tenant_id: str, shop_id: str) -> str:

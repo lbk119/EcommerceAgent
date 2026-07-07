@@ -180,6 +180,10 @@ async def start_agent_task(payload: dict):
                 final_result = await asyncio.wait_for(agent_call, timeout=int(payload.get("max_runtime_seconds") or os.getenv("AI_CHAT_MAX_RUNTIME_SECONDS", "180")))
             else:
                 from agent.main_agent import run_deep_agent
+                from agent.planning.schemas import TaskPlan
+
+                task_plan_payload = payload.get("task_plan") if isinstance(payload.get("task_plan"), dict) else None
+                task_plan_override = TaskPlan.from_dict(task_plan_payload) if task_plan_payload else None
 
                 agent_call = run_deep_agent(
                     payload["query"],
@@ -189,6 +193,7 @@ async def start_agent_task(payload: dict):
                     user_id=payload["user_id"],
                     shop_id=payload["shop_id"],
                     runtime_profile=payload.get("runtime_profile") or "full",
+                    task_plan_override=task_plan_override,
                 )
                 final_result = await agent_call
             final_markdown = result_markdown(final_result)

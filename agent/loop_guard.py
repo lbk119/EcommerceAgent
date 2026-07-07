@@ -1,17 +1,30 @@
+"""Agent 循环检测与轻量监督器。
+
+DeepAgent / LangGraph 执行过程中可能出现“反复调用同一工具、没有新信息”的无进展循环。
+本模块提供两层保护：
+1. 本地 fingerprint：用工具名 + 压缩参数生成哈希，快速发现近期重复调用；
+2. Supervisor LLM：在调用次数达到间隔或接近递归上限时，低频判断是否继续、反思或中止。
+
+这些保护用于减少无意义成本消耗，并给用户返回可解释的阶段性失败原因。
+"""
+
 import hashlib
 import json
 import os
 
 
 class AgentLoopGuard:
-    """Shared loop guard for main-agent calls and LangGraph workflow nodes.
-
-    It has two layers:
-    1. local fingerprints catch exact or near-exact repeated actions cheaply;
-    2. a lightweight supervisor LLM checks semantic loops at low frequency.
-    """
+    """主 Agent 调用和 LangGraph 节点共享的循环保护器。"""
 
     def __init__(self, env_prefix="AGENT_LOOP", events=None, fingerprints=None, last_supervised_count=0):
+        """初始化循环保护器，并从环境变量读取阈值。
+
+        Args:
+            env_prefix: 环境变量前缀，允许不同运行场景使用不同阈值。
+            events: 已发生调用摘要，恢复执行时用于延续判断。
+            fingerprints: 已发生调用指纹，恢复执行时用于延续重复检测。
+            last_supervised_count: 上一次触发 LLM supervisor 时的调用数量。
+        """
         self.env_prefix = env_prefix
         self.events = list(events or [])
         self.fingerprints = list(fingerprints or [])
@@ -24,12 +37,17 @@ class AgentLoopGuard:
         self.last_supervised_count = last_supervised_count
 
     def record_tool_call(self, tool_call):
+        """记录 LangChain/DeepAgents 工具调用，并返回可能的循环摘要。"""
         name = tool_call.get("name", "unknown")
         args = tool_call.get("args", {})
         event = self._format_event(name, args)
         return self.record_event(name, args, event)
 
     def record_event(self, name, args=None, event=None):
+        """记录任意工具/节点事件。
+
+        返回 None 表示暂未发现循环；返回字符串表示已触发本地循环规则，上层应进入反思或中止处理。
+        """
         args = args or {}
         event = event or self._format_event(name, args)
         fingerprint = self._fingerprint(name, args)
@@ -46,6 +64,7 @@ class AgentLoopGuard:
         return None
 
     def should_supervise(self, recursion_limit):
+        """判断当前是否应该调用 LLM supervisor 做语义层循环判断。"""
         if not self.supervisor_enabled:
             return False
         if len(self.events) == 0 or self.last_supervised_count == len(self.events):
@@ -59,10 +78,12 @@ class AgentLoopGuard:
         return False
 
     def summary(self, reason):
+        """构造给用户/监督器看的近期调用摘要。"""
         recent_events = self.events[-self.recent_window:]
         return reason + "。最近调用：\n" + "\n".join(f"- {event}" for event in recent_events)
 
     def snapshot(self):
+        """导出可持久化快照，便于中断恢复后继续检测循环。"""
         return {
             "loop_events": self.events,
             "loop_fingerprints": self.fingerprints,
@@ -70,11 +91,13 @@ class AgentLoopGuard:
         }
 
     def _fingerprint(self, name, args):
+        """把工具名和压缩后的参数变成稳定哈希，用于检测近似重复调用。"""
         compact_args = self._compact_args(args)
         raw = json.dumps({"name": name, "args": compact_args}, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _format_event(self, name, args):
+        """把工具/子助手调用格式化为简短中文摘要。"""
         if name == "task" and isinstance(args, dict):
             assistant = args.get("subagent_type", "unknown")
             description = str(args.get("description", ""))[:160]
@@ -83,6 +106,7 @@ class AgentLoopGuard:
         return f"调用工具/节点 {name}: {json.dumps(compact_args, ensure_ascii=False, default=str)[:220]}"
 
     def _compact_args(self, args):
+        """压缩参数体，避免循环检测缓存保存过大的上下文或敏感原文。"""
         if not isinstance(args, dict):
             return str(args)[:240]
 
@@ -98,6 +122,7 @@ class AgentLoopGuard:
 
 
 def build_supervisor_prompt(summary):
+    """构造 Supervisor LLM 的严格 JSON 判断提示词。"""
     return f"""
 你是多智能体执行监督器，只判断任务执行是否陷入无进展循环。
 
@@ -117,6 +142,7 @@ def build_supervisor_prompt(summary):
 
 
 def parse_supervisor_response(response):
+    """解析 supervisor 响应，兼容返回 JSON fenced block 的情况。"""
     content = response.content if hasattr(response, "content") else str(response)
     content = content.strip()
     if content.startswith("```"):
@@ -132,6 +158,7 @@ def parse_supervisor_response(response):
 
 
 async def evaluate_loop_with_supervisor(summary):
+    """异步调用 critic 模型判断是否陷入语义循环；失败时默认继续执行。"""
     try:
         from agent.llm import get_critic_model
 
@@ -142,6 +169,7 @@ async def evaluate_loop_with_supervisor(summary):
 
 
 def evaluate_loop_with_supervisor_sync(summary):
+    """同步版本的 supervisor 判断，用于非 async 执行路径。"""
     try:
         from agent.llm import get_critic_model
 

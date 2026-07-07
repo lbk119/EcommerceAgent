@@ -10,9 +10,13 @@ from typing import Any, Dict
 
 
 SECRET_PATTERNS = (
+    # key=value / key: value 形式的密钥字段。
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd)\s*[:=]\s*['\"]?[^'\"\s,;}]+"),
+    # HTTP Authorization 常见格式。
     re.compile(r"(?i)bearer\s+[a-z0-9._\-]+"),
+    # 数据库或缓存连接串。
     re.compile(r"(?i)(mysql|postgresql|postgres|redis)://[^\s]+"),
+    # OpenAI 风格 sk-* token。
     re.compile(r"sk-[a-zA-Z0-9]{20,}"),
 )
 
@@ -39,6 +43,7 @@ def redact_secrets(value: Any) -> Any:
 
 
 def _redact_dict(payload: Dict[Any, Any]) -> Dict[Any, Any]:
+    """脱敏 dict：敏感 key 直接整值替换，其它字段递归处理。"""
     safe_payload: Dict[Any, Any] = {}
     for key, item in payload.items():
         if isinstance(key, str) and re.search(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd)", key):
@@ -49,6 +54,7 @@ def _redact_dict(payload: Dict[Any, Any]) -> Dict[Any, Any]:
 
 
 def _replace_secret(match: re.Match) -> str:
+    """根据匹配形态生成可读的脱敏占位。"""
     text = match.group(0)
     if "://" in text:
         scheme = text.split("://", 1)[0]

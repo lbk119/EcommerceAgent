@@ -10,6 +10,7 @@ from typing import Dict, List
 
 
 MAX_PROMPT_CHARS = 12000
+# 轻量 prompt 注入关键词表。这里不是内容安全分类器，只识别明显想突破系统边界的指令。
 INJECTION_PHRASES = (
     "忽略系统提示",
     "忽略以上指令",
@@ -46,12 +47,15 @@ def inspect_user_prompt(query: str) -> PromptGuardResult:
     当前采取“标记风险但不断路”的策略，避免误杀真实业务请求；AgentRuntime 会把结果写入 trace，
     后续可以按风险等级升级为人工确认或拒绝执行。
     """
+    # 使用 lower 做大小写无关匹配；中文关键词不受影响，英文注入短语可统一识别。
     normalized = query.lower()
     reasons = [phrase for phrase in INJECTION_PHRASES if phrase.lower() in normalized]
+    # 即使命中风险词也不丢弃原问题，只截断到安全长度；是否继续由上层策略决定。
     sanitized_query = query[:MAX_PROMPT_CHARS]
     if len(query) > MAX_PROMPT_CHARS:
         reasons.append("prompt_too_large_truncated")
 
+    # 当前只区分 high/low，保持调用方逻辑简单；未来可引入 medium 或更细审查策略。
     risk = "high" if reasons else "low"
     return PromptGuardResult(
         allowed=True,
@@ -62,7 +66,10 @@ def inspect_user_prompt(query: str) -> PromptGuardResult:
 
 
 def sanitize_prompt_text(text: str, max_chars: int = MAX_PROMPT_CHARS) -> str:
-    """限制外部文本进入 prompt 的最大长度，供上传文件摘要或未来 RAG 片段复用。"""
+    """限制外部文本进入 prompt 的最大长度，供上传文件摘要或未来 RAG 片段复用。
+
+    这个函数不做语义审查，只解决 prompt 体积问题；敏感信息脱敏应使用 security.redaction。
+    """
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n[内容过长，已截断]"

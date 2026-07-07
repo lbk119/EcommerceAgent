@@ -1,3 +1,15 @@
+"""Agent 侧 MySQL 访问工具。
+
+这个模块服务两类场景：
+1. LangChain/DeepAgents 工具需要读取电商经营表、展示 schema 或执行只读 SQL；
+2. 受控 workflow 节点需要在明确权限下执行少量写入/DDL。
+
+安全边界：
+- 经营数据表必须绑定当前 ContextVar 中的 tenant_id/shop_id；
+- 自由 SQL 默认只允许只读语句，并要求访问经营表时显式包含 tenant_id/shop_id；
+- 写 SQL 不暴露为 LangChain tool，只供受控节点在额外权限检查后调用。
+"""
+
 import os
 import re
 from pathlib import Path
@@ -9,8 +21,10 @@ from api.context import get_identity_context
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 加载仓库根目录 .env，保证脚本、FastAPI 和 Agent 工具读到同一套 MySQL 配置。
 load_dotenv(PROJECT_ROOT / ".env")
 
+# 这些表包含租户/店铺经营数据，任何读取都必须走 tenant/shop 隔离兜底。
 TENANT_SCOPED_TABLES = {
     "customers",
     "sellers",
@@ -29,7 +43,14 @@ TENANT_SCOPED_TABLES = {
 
 
 def get_db_config() -> dict:
-    """Get database configuration from environment variables."""
+    """从环境变量读取 MySQL 连接配置。
+
+    Returns:
+        dict: mysql.connector.connect 可直接使用的配置字典。
+
+    Raises:
+        ValueError: 缺少 MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE 等核心配置。
+    """
     config = {
         "host": os.getenv("MYSQL_HOST", "localhost"),
         "port": int(os.getenv("MYSQL_PORT", "3306")),
@@ -43,6 +64,7 @@ def get_db_config() -> dict:
     }
     config = {key: value for key, value in config.items() if value is not None}
 
+    # user/password/database 是本项目访问 MySQL 的最低要求；缺失时尽早失败，避免下游报错含糊。
     missing_keys = [key for key in ("user", "password", "database") if key not in config]
     if missing_keys:
         raise ValueError(f"缺失数据库核心配置：{', '.join(missing_keys)}")
@@ -50,7 +72,7 @@ def get_db_config() -> dict:
 
 
 def list_sql_tables_raw() -> str:
-    """Return available table names in the configured database."""
+    """列出当前数据库可用表名，返回适合模型阅读的纯文本。"""
     try:
         with connect(**get_db_config()) as conn:
             with conn.cursor() as cursor:
@@ -65,7 +87,10 @@ def list_sql_tables_raw() -> str:
 
 
 def get_table_schema_raw(table_name: str) -> str:
-    """Return column metadata for one table."""
+    """返回单表字段元数据。
+
+    该函数用于数据库助手理解字段结构；这里只读 SHOW COLUMNS，不返回真实业务数据。
+    """
     try:
         with connect(**get_db_config()) as conn:
             with conn.cursor() as cursor:
@@ -81,11 +106,16 @@ def get_table_schema_raw(table_name: str) -> str:
 
 
 def get_table_data_raw(table_name: str, limit: int = 20) -> str:
-    """Return limited table data as CSV-style text."""
+    """返回有限行数的表数据，格式为 CSV 风格文本。
+
+    对经营表会自动拼接当前 tenant/shop 条件；没有可信身份上下文时直接拒绝，防止本地工具被
+    LLM 或测试脚本误用成跨租户读数入口。
+    """
     if table_name in TENANT_SCOPED_TABLES:
         scope = current_data_scope_sql(table_name)
         if not scope:
             return "查询被拒绝：缺少可信 tenant/shop 上下文，不能读取店铺经营数据。"
+    # 硬限制最多 100 行，避免模型一次拉取过多数据造成性能和隐私风险。
     limit = max(1, min(int(limit), 100))
     try:
         with connect(**get_db_config()) as conn:
@@ -104,7 +134,11 @@ def get_table_data_raw(table_name: str, limit: int = 20) -> str:
 
 
 def execute_read_sql_raw(query: str) -> str:
-    """Execute a read-only SQL statement and return CSV-style text."""
+    """执行只读 SQL，并以 CSV 风格文本返回结果。
+
+    允许 SELECT/WITH/SHOW/DESCRIBE/DESC；SELECT 若未写 LIMIT，会自动追加 LIMIT 100。
+    注意这里不尝试重写 LLM 生成的复杂 SQL，只做“是否只读”和“是否显式租户隔离”的兜底检查。
+    """
     config = get_db_config()
     stripped_query = query.strip().rstrip(";")
     if not re.match(r"^(select|with|show|describe|desc)\b", stripped_query, re.IGNORECASE):
@@ -112,6 +146,7 @@ def execute_read_sql_raw(query: str) -> str:
     if re.match(r"^select\b", stripped_query, re.IGNORECASE) and not re.search(r"\blimit\b", stripped_query, re.IGNORECASE):
         stripped_query = f"{stripped_query} LIMIT 100"
 
+    # 自由 SQL 是最容易跨租户泄漏的入口，因此在真正执行前统一做隔离校验。
     isolation_error = validate_tenant_scoped_read_sql(stripped_query)
     if isolation_error:
         return isolation_error
@@ -132,7 +167,11 @@ def execute_read_sql_raw(query: str) -> str:
 
 
 def current_data_scope_sql(alias: str | None = None) -> str:
-    """生成当前请求的 tenant/shop SQL 条件；没有可信上下文时返回空字符串。"""
+    """生成当前请求的 tenant/shop SQL 条件；没有可信上下文时返回空字符串。
+
+    Args:
+        alias: 可选表别名；传入后生成 `alias.tenant_id = ...` 形式，方便 JOIN 查询复用。
+    """
     identity = get_identity_context()
     if not identity or not identity.tenant_id or not identity.shop_id:
         return ""
@@ -159,15 +198,19 @@ def validate_tenant_scoped_read_sql(query: str) -> str:
 
 
 def _escape_sql_literal(value: str) -> str:
+    """转义 SQL 字符串字面量中的单引号。
+
+    这里仅用于拼接受控的 tenant/shop 条件；普通业务查询仍应优先使用参数化 SQL。
+    """
     return value.replace("'", "''")
 
 
 def execute_write_sql_raw(query: str, target_database: str | None = None) -> dict:
     """
-    Internal write executor for controlled workflow nodes.
+    受控 workflow 节点内部使用的写 SQL 执行器。
 
-    It is intentionally not a LangChain tool. Tool wrappers and deterministic workflow nodes may call it after
-    their own permission checks.
+    它刻意不是 LangChain tool。工具 wrapper 或确定性 workflow 节点在完成自己的权限检查、sandbox
+    检查、人工审核后，才可以调用这里执行真正写入。
     """
     stripped_query = query.strip().rstrip(";")
     statement_head = stripped_query.split(None, 1)[0].lower() if stripped_query else ""
@@ -177,12 +220,14 @@ def execute_write_sql_raw(query: str, target_database: str | None = None) -> dic
     if statement_head in {"update", "delete"} and not re.search(r"\bwhere\b", stripped_query, re.IGNORECASE):
         return {"ok": False, "error": "UPDATE/DELETE 必须包含 WHERE 条件，已拒绝执行。"}
 
+    # DROP/TRUNCATE 默认禁止，只有本地显式设置 DB_ALLOW_DANGEROUS_DDL=true 才允许。
     if statement_head in {"drop", "truncate"} and os.getenv("DB_ALLOW_DANGEROUS_DDL", "false").lower() != "true":
         return {"ok": False, "error": "DROP/TRUNCATE 属于高危 DDL，默认禁止执行。"}
 
     config = get_db_config()
     if target_database:
         config["database"] = target_database
+    # 写操作使用显式事务；执行成功后 commit，异常时连接关闭会回滚未提交事务。
     config["autocommit"] = False
 
     try:
