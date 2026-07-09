@@ -1,29 +1,25 @@
-"""
-任务运行上下文准备。
+"""任务运行上下文准备。
 
-主 Agent 执行前需要做几件和模型无关的准备工作：
+Agent 执行前需要完成几件和模型无关的准备工作：
 - 为当前 conversation 创建 output/session_xxx 工作目录；
-- 把 updated/session_xxx 中的上传文件复制到 output/session_xxx，方便前端统一下载；
+- 将 updated/session_xxx 中的上传文件复制到 output/session_xxx，方便前端统一下载；
 - 设置 ContextVar，让工具能拿到 session_dir、thread_id、tenant/user/shop 身份；
 - 构造 LangGraph/DeepAgents 运行 config；
 - 构造给模型看的“工作目录 + 上传文件 + 长期记忆”提示片段。
 
-这些逻辑原本堆在 main_agent.py 里，会让主入口同时关心文件系统、上下文变量、记忆检索和
-LangGraph 配置。拆到这里后，main_agent.py 只需要“创建 TaskRunContext -> 调 runner”。
+这些逻辑拆到这里后，主入口只需要创建 TaskRunContext 并交给 runner，避免文件系统、身份、
+记忆召回和图配置散落在多个执行阶段。
 """
 
 import os
 import shutil
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from api.context import reset_session_context, set_identity_context, set_session_context, set_thread_context
 from api.monitor import monitor
-from agent.memory.retriever import format_long_term_memory_context, retrieve_long_term_memories
-from agent.memory.schema import MemoryIdentity
-from agent.observability.tracer import tracer
+from agent.memory import MemoryIdentity
 
 
 PROJECT_ROOT = Path(__file__).parents[2].resolve()
@@ -34,7 +30,7 @@ class TaskRunContext:
     """
     单次任务运行时的上下文快照。
 
-    这个对象只在一次 run_deep_agent 调用中使用，不跨任务复用。它把文件目录、身份、LangGraph
+    这个对象只在一次 run_agent_task 调用中使用，不跨任务复用。它把文件目录、身份、LangGraph
     config 和 prompt 片段放在一起，避免函数之间传一长串松散参数。
     """
 
@@ -65,7 +61,7 @@ def build_task_context(
     shop_id: str,
 ) -> TaskRunContext:
     """
-    准备主 Agent 执行所需的全部运行上下文。
+    准备 Agent 执行所需的全部运行上下文。
 
     注意：这个函数会设置 ContextVar，所以调用方必须在 finally 中调用 context.cleanup()。
     """
@@ -78,7 +74,7 @@ def build_task_context(
     )
     session_dir = PROJECT_ROOT / "output" / f"session_{conversation_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
-    # Agent prompt 和工具统一使用正斜杠路径，减少 Windows 反斜杠被模型转义/误读的概率。
+    # Agent prompt 和工具统一使用正斜杠路径，减少 Windows 反斜杠被模型转义或误读的概率。
     session_dir_str = str(session_dir).replace("\\", "/")
     relative_session_dir_str = str(session_dir.relative_to(PROJECT_ROOT)).replace("\\", "/")
 
@@ -124,7 +120,7 @@ def _copy_uploaded_files(conversation_id: str, session_dir: Path) -> str:
     """
     把上传目录中的文件复制到本次 output/session 目录，并返回给模型看的上传文件提示。
 
-    工具层只允许读 session_dir 内的文件。这里做一次复制，可以把“用户上传文件”和“Agent 产物”
+    工具层只允许读取 session_dir 内的文件。这里做一次复制，可以把“用户上传文件”和“Agent 产物”
     都统一放到一个安全工作目录中，前端下载和工具读取也更简单。
     """
     updated_dir = PROJECT_ROOT / "updated" / f"session_{conversation_id}"
@@ -152,48 +148,18 @@ def _build_path_instruction(
     relative_session_dir_str: str,
     updated_info_prompt: str,
 ) -> str:
-    """构造追加到用户问题后的工作环境提示，包括长期记忆召回结果。"""
-    started_at = time.perf_counter()
-    # 记忆召回属于可观测阶段：即使没有召回结果，也要让时间线显示该阶段已完成。
-    tracer.emit(
-        "memory_retrieval_started",
-        trace_id=task_id,
-        task_id=task_id,
-        conversation_id=conversation_id,
-        agent_name="memory_retriever",
-        metadata={"stage": "memory_retrieval", "status": "running"},
-    )
-    long_term_memories = retrieve_long_term_memories(identity, task_query, top_k=5)
-    latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
-    tracer.emit(
-        "memory_retrieval_finished",
-        trace_id=task_id,
-        task_id=task_id,
-        conversation_id=conversation_id,
-        agent_name="memory_retriever",
-        latency_ms=latency_ms,
-        metadata={"stage": "memory_retrieval", "status": "completed", "count": len(long_term_memories), "retrieval": long_term_memories[0].get("retrieval") if long_term_memories else None},
-    )
-    tracer.emit(
-        "memory_retrieved",
-        trace_id=task_id,
-        task_id=task_id,
-        conversation_id=conversation_id,
-        agent_name="main_agent",
-        latency_ms=latency_ms,
-        metadata={"count": len(long_term_memories), "retrieval": long_term_memories[0].get("retrieval") if long_term_memories else None},
-    )
-    memory_context = format_long_term_memory_context(long_term_memories)
-    # 这段文本会追加到用户问题后交给 Agent，因此只放工作目录、上传文件和精选长期记忆，不放内部 token。
+    """构造追加到用户请求后的工作环境提示。
+
+    DeepAgents store 是唯一长期记忆后端。本项目不再在外层 runtime 额外执行 MySQL 记忆召回。
+    """
     return f"""
     【工作环境指令】
     工作目录: {relative_session_dir_str}
     {updated_info_prompt}
-    {memory_context}
 
-    规则：
-    1. 新生成文件必须保存到工作目录：'{relative_session_dir_str}/filename'
-    2. 读取已上传的文件时，请直接将文件名（例如：'开篇.txt'）作为 filename 参数传入（read_file_content）读取工具，不要带上任何目录前缀。
-    3. 使用相对路径，禁止使用绝对路径
+    规则:
+    1. 新生成文件必须保存到工作目录 {relative_session_dir_str}/filename
+    2. 读取已上传文件时，直接将文件名作为 filename 参数传入 read_file_content，不要带目录前缀。
+    3. 使用相对路径，禁止使用绝对路径。
     4. 若存在上传文件，请先分析内容
     """

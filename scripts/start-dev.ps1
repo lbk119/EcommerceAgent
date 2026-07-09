@@ -159,8 +159,7 @@ SetProcessEnvIfEmpty "LLM_FAST_MAX_RETRIES" "1"
 SetProcessEnvIfEmpty "LLM_DEEP_TIMEOUT_SECONDS" "60"
 SetProcessEnvIfEmpty "LLM_DEEP_MAX_RETRIES" "1"
 SetProcessEnvIfEmpty "STANDARD_AGENT_ALLOW_DEEPAGENT_FALLBACK" "false"
-SetProcessEnvIfEmpty "DEEP_AGENT_ENABLE_NETWORK_SEARCH" "false"
-SetProcessEnvIfEmpty "DEEP_AGENT_ENABLE_KNOWLEDGE_BASE" "false"
+SetProcessEnvIfEmpty "DEEPAGENTS_DEEP_ENABLE_NETWORK_SEARCH" "true"
 SetProcessEnvIfEmpty "AGENT_HOT_PATH_MEMORY_WRITE" "false"
 
 if ((GetProcessEnv "GATEWAY_USER_STORE_BACKEND") -eq "mysql" -and [string]::IsNullOrEmpty((GetProcessEnv "MYSQL_PASSWORD"))) {

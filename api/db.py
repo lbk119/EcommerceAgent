@@ -1,8 +1,4 @@
-"""平台 API 的数据库访问工具。
-
-这个模块故意保持轻量：只封装 MySQL 连接、查询、写入和平台表初始化，不导入 Agent 模型、
-工具注册表或工作流，避免 FastAPI 启动时触发大模型初始化。
-"""
+"""Lightweight database helpers for platform API routes."""
 
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ from typing import Any, Iterable
 
 from mysql.connector import connect
 
-from agent.core.db import get_db_config
+from agent.platform.db import get_db_config
 
 
 _platform_schema_ready = False
@@ -21,14 +17,7 @@ _platform_schema_lock = Lock()
 
 @contextmanager
 def mysql_conn(dictionary: bool = True):
-    """创建 MySQL 连接。
-
-    Args:
-        dictionary: 为 True 时 cursor 返回 dict，便于直接组装 JSON 响应。
-
-    注意：这里复用 agent.core.db.get_db_config，确保平台 API 与 Agent 工具读同一个
-    ecommerce_demo 数据库和同一套环境变量。
-    """
+    """Create a MySQL connection and cursor for platform API routes."""
     conn = connect(**get_db_config())
     try:
         yield conn, conn.cursor(dictionary=dictionary)
@@ -37,21 +26,21 @@ def mysql_conn(dictionary: bool = True):
 
 
 def fetch_all(sql: str, params: Iterable[Any] | None = None) -> list[dict[str, Any]]:
-    """执行 SELECT 并返回 dict 列表。"""
+    """执行 SELECT 并返?dict 列表?"""
     with mysql_conn(dictionary=True) as (_, cursor):
         cursor.execute(sql, tuple(params or ()))
         return list(cursor.fetchall() or [])
 
 
 def fetch_one(sql: str, params: Iterable[Any] | None = None) -> dict[str, Any] | None:
-    """执行 SELECT 并返回单行 dict；没有结果时返回 None。"""
+    """执行 SELECT 并返回单?dict；没有结果时返回 None?"""
     with mysql_conn(dictionary=True) as (_, cursor):
         cursor.execute(sql, tuple(params or ()))
         return cursor.fetchone()
 
 
 def execute(sql: str, params: Iterable[Any] | None = None) -> int:
-    """执行 INSERT/UPDATE/DELETE 并提交事务，返回 affected rows。"""
+    """执行 INSERT/UPDATE/DELETE 并提交事务，返回 affected rows?"""
     with mysql_conn(dictionary=True) as (conn, cursor):
         cursor.execute(sql, tuple(params or ()))
         affected = cursor.rowcount
@@ -60,7 +49,7 @@ def execute(sql: str, params: Iterable[Any] | None = None) -> int:
 
 
 def execute_many(sql: str, rows: Iterable[Iterable[Any]]) -> int:
-    """批量执行同一条写 SQL，减少请求期反复建连接的开销。"""
+    """批量执行同一条写 SQL，减少请求期反复建连接的开销?"""
     rows = list(rows)
     if not rows:
         return 0
@@ -72,7 +61,7 @@ def execute_many(sql: str, rows: Iterable[Iterable[Any]]) -> int:
 
 
 def table_exists(table_name: str) -> bool:
-    """检查表是否存在，用于请求期幂等初始化平台表。"""
+    """检查表是否存在，用于请求期幂等初始化平台表?"""
     row = fetch_one(
         """
         SELECT COUNT(*) AS count
@@ -85,7 +74,7 @@ def table_exists(table_name: str) -> bool:
 
 
 def column_exists(table_name: str, column_name: str) -> bool:
-    """检查字段是否存在；兼容老 MySQL，不依赖 ADD COLUMN IF NOT EXISTS。"""
+    """检查字段是否存在；兼容?MySQL，不依赖 ADD COLUMN IF NOT EXISTS?"""
     row = fetch_one(
         """
         SELECT COUNT(*) AS count
@@ -98,11 +87,7 @@ def column_exists(table_name: str, column_name: str) -> bool:
 
 
 def ensure_platform_schema() -> None:
-    """幂等创建平台 SaaS 表，并补齐 gateway 表的产品字段。
-
-    这里不是替代正式迁移，而是为了本地开发体验：只要 Brain 启动并有 MySQL 权限，前端
-    调用 workspace/onboarding 时就不会因为平台表缺失而 500。
-    """
+    """Create or patch local platform tables idempotently for development."""
     global _platform_schema_ready
     if _platform_schema_ready:
         return
@@ -288,7 +273,7 @@ def ensure_platform_schema() -> None:
     for statement in statements:
         execute(statement)
 
-    # 老版本 gateway_shops 可能只有 auth_status/data_status；逐列补齐产品字段。
+    # 老版?gateway_shops 可能只有 auth_status/data_status；逐列补齐产品字段?
     for column_name, ddl in {
         "category": "ALTER TABLE gateway_shops ADD COLUMN category VARCHAR(128) NOT NULL DEFAULT ''",
         "platform": "ALTER TABLE gateway_shops ADD COLUMN platform VARCHAR(64) NOT NULL DEFAULT 'taobao_tmall'",

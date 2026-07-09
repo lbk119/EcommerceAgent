@@ -2,6 +2,7 @@ package router
 
 import (
 	"net/http"
+	"time"
 
 	"DeepAgent/gateway/internal/auth"
 	"DeepAgent/gateway/internal/authorization"
@@ -129,7 +130,7 @@ func registerV1Routes(engine *gin.Engine, brainProxy *proxy.BrainProxy, tokenMan
 	v1.GET("/metrics/agents", brainProxy.ServeWithPath("/api/metrics/agents"))
 	v1.GET("/agent-runtime/health", brainProxy.ServeWithPath("/api/agent-runtime/health"))
 	v1.GET("/agent-runtime/metrics", brainProxy.ServeWithPath("/api/agent-runtime/metrics"))
-	v1.GET("/agent-runtime/slow-tasks", brainProxy.ServeWithPath("/api/agent-runtime/slow-tasks"))
+	v1.GET("/agent-runtime/slow-tasks", brainProxy.ServeDiagnosticWithPath("/api/agent-runtime/slow-tasks", 3*time.Second))
 	v1.GET("/agent-runtime/tasks/:task_id/diagnosis", func(c *gin.Context) {
 		c.Request.URL.Path = "/api/agent-runtime/tasks/" + c.Param("task_id") + "/diagnosis"
 		brainProxy.Serve(c)

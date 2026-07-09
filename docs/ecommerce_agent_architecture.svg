@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320" role="img" aria-labelledby="title desc">
+  <title id="title">EcommerceAgent DeepAgents Architecture</title>
+  <desc id="desc">A complete architecture diagram for the DeepAgents-centered EcommerceAgent system, showing gateway, runtime, planner, subagents, tools, memory, trace, security, evaluation, and report flows.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .panel { fill: #ffffff; stroke: #c9d2df; stroke-width: 2; rx: 18; }
+      .panel-blue { fill: #eef6ff; stroke: #8bbbe8; stroke-width: 2; rx: 18; }
+      .panel-green { fill: #eefaf3; stroke: #8ac99d; stroke-width: 2; rx: 18; }
+      .panel-amber { fill: #fff7e8; stroke: #e0b15b; stroke-width: 2; rx: 18; }
+      .panel-red { fill: #fff0f0; stroke: #d68a8a; stroke-width: 2; rx: 18; }
+      .panel-purple { fill: #f5f1ff; stroke: #ad9be8; stroke-width: 2; rx: 18; }
+      .title { font: 700 34px Arial, "Microsoft YaHei", sans-serif; fill: #1d2939; }
+      .subtitle { font: 400 17px Arial, "Microsoft YaHei", sans-serif; fill: #526173; }
+      .section-title { font: 700 22px Arial, "Microsoft YaHei", sans-serif; fill: #1d2939; }
+      .label { font: 700 17px Arial, "Microsoft YaHei", sans-serif; fill: #243143; }
+      .text { font: 400 15px Arial, "Microsoft YaHei", sans-serif; fill: #344054; }
+      .small { font: 400 13px Arial, "Microsoft YaHei", sans-serif; fill: #5f6f82; }
+      .tiny { font: 400 12px Arial, "Microsoft YaHei", sans-serif; fill: #667085; }
+      .chip { fill: #ffffff; stroke: #d6dee8; stroke-width: 1.5; rx: 10; }
+      .line { stroke: #526173; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .line-soft { stroke: #8a98aa; stroke-width: 1.8; fill: none; marker-end: url(#arrow-soft); stroke-dasharray: 7 6; }
+      .line-green { stroke: #2f8c57; stroke-width: 2.4; fill: none; marker-end: url(#arrow-green); }
+      .line-red { stroke: #b54747; stroke-width: 2.2; fill: none; marker-end: url(#arrow-red); }
+      .line-purple { stroke: #755bd6; stroke-width: 2.2; fill: none; marker-end: url(#arrow-purple); }
+      .box-shadow { filter: url(#shadow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#526173" />
+    </marker>
+    <marker id="arrow-soft" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8a98aa" />
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#2f8c57" />
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#b54747" />
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#755bd6" />
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#1d2939" flood-opacity="0.11"/>
+    </filter>
+  </defs>
+
+  <rect class="bg" width="1800" height="1320"/>
+
+  <text x="60" y="62" class="title">EcommerceAgent 新架构总览</text>
+  <text x="60" y="94" class="subtitle">DeepAgents 作为统一调度底座：Planner 只做意图澄清和任务分派，业务能力沉到 subagent + tools，长期记忆只走 DeepAgents Store。</text>
+
+  <!-- Top entry layer -->
+  <rect x="60" y="130" width="1680" height="150" class="panel box-shadow"/>
+  <text x="90" y="170" class="section-title">入口层</text>
+  <rect x="90" y="195" width="280" height="58" class="chip"/>
+  <text x="115" y="220" class="label">用户 / 前端 UI</text>
+  <text x="115" y="242" class="small">聊天框、后台任务、报告触发</text>
+  <rect x="460" y="195" width="310" height="58" class="chip"/>
+  <text x="485" y="220" class="label">Go Gateway</text>
+  <text x="485" y="242" class="small">鉴权、代理、超时、路由</text>
+  <rect x="860" y="195" width="330" height="58" class="chip"/>
+  <text x="885" y="220" class="label">Python API Server</text>
+  <text x="885" y="242" class="small">/ai-chat /agent-runtime /tools</text>
+  <rect x="1280" y="195" width="350" height="58" class="chip"/>
+  <text x="1305" y="220" class="label">AgentRuntime</text>
+  <text x="1305" y="242" class="small">profile、budget、任务生命周期</text>
+  <path d="M370 224 L460 224" class="line"/>
+  <path d="M770 224 L860 224" class="line"/>
+  <path d="M1190 224 L1280 224" class="line"/>
+
+  <!-- Runtime layer -->
+  <rect x="60" y="330" width="500" height="370" class="panel-blue box-shadow"/>
+  <text x="90" y="370" class="section-title">agent/runtime</text>
+  <rect x="90" y="400" width="420" height="58" class="chip"/>
+  <text x="115" y="424" class="label">Profile Router</text>
+  <text x="115" y="446" class="small">realtime / standard / release</text>
+  <rect x="90" y="478" width="420" height="58" class="chip"/>
+  <text x="115" y="502" class="label">Budget &amp; Guardrails</text>
+  <text x="115" y="524" class="small">token、step、timeout、循环保护</text>
+  <rect x="90" y="556" width="420" height="58" class="chip"/>
+  <text x="115" y="580" class="label">Task Context</text>
+  <text x="115" y="602" class="small">任务 ID、用户、会话、执行状态</text>
+  <rect x="90" y="634" width="420" height="38" class="chip"/>
+  <text x="115" y="659" class="text">Result Pipeline：格式化结果、写 trace、跳过外层记忆写入</text>
+
+  <rect x="650" y="330" width="500" height="370" class="panel-purple box-shadow"/>
+  <text x="680" y="370" class="section-title">agent/plan</text>
+  <rect x="680" y="400" width="420" height="70" class="chip"/>
+  <text x="705" y="425" class="label">PlannerAgent / Main Agent Prompt</text>
+  <text x="705" y="447" class="small">理解用户原始输入，拆出子任务、依赖和交付目标</text>
+  <rect x="680" y="492" width="420" height="70" class="chip"/>
+  <text x="705" y="517" class="label">AgentTaskPlan</text>
+  <text x="705" y="539" class="small">subagent、instructions、dependencies、expected_output</text>
+  <rect x="680" y="584" width="420" height="70" class="chip"/>
+  <text x="705" y="609" class="label">Dependency Planner</text>
+  <text x="705" y="631" class="small">无依赖并行，有依赖上游结果驱动下游分析</text>
+
+  <rect x="1240" y="330" width="500" height="370" class="panel-green box-shadow"/>
+  <text x="1270" y="370" class="section-title">agent/subagent</text>
+  <rect x="1270" y="400" width="420" height="58" class="chip"/>
+  <text x="1295" y="424" class="label">DeepAgents Runtime</text>
+  <text x="1295" y="446" class="small">sub_agents、store、checkpoint、context 管理</text>
+  <rect x="1270" y="478" width="420" height="58" class="chip"/>
+  <text x="1295" y="502" class="label">Middleware / Guard</text>
+  <text x="1295" y="524" class="small">循环检测、最大 step、异常降级、人审入口</text>
+  <rect x="1270" y="556" width="420" height="58" class="chip"/>
+  <text x="1295" y="580" class="label">HITL / MCP / Filesystem</text>
+  <text x="1295" y="602" class="small">human-in-the-loop、MCP 工具、受控文件访问</text>
+  <rect x="1270" y="634" width="420" height="38" class="chip"/>
+  <text x="1295" y="659" class="text">Subagent Registry：业务 Agent 注册和说明</text>
+
+  <path d="M1490 280 L1490 330" class="line"/>
+  <path d="M560 515 L650 515" class="line"/>
+  <path d="M1150 515 L1240 515" class="line"/>
+
+  <!-- Subagents and tools -->
+  <rect x="60" y="750" width="820" height="300" class="panel box-shadow"/>
+  <text x="90" y="790" class="section-title">业务 Subagents</text>
+  <rect x="90" y="820" width="230" height="70" class="chip"/>
+  <text x="115" y="845" class="label">Chat Agent</text>
+  <text x="115" y="867" class="small">realtime 日常问答</text>
+  <rect x="345" y="820" width="230" height="70" class="chip"/>
+  <text x="370" y="845" class="label">Report Agent</text>
+  <text x="370" y="867" class="small">日报、周报、经营报告</text>
+  <rect x="600" y="820" width="230" height="70" class="chip"/>
+  <text x="625" y="845" class="label">Analysis Agent</text>
+  <text x="625" y="867" class="small">商品、活动、指标分析</text>
+  <rect x="90" y="915" width="230" height="70" class="chip"/>
+  <text x="115" y="940" class="label">Data Agent</text>
+  <text x="115" y="962" class="small">数据库查询、质量检查</text>
+  <rect x="345" y="915" width="230" height="70" class="chip"/>
+  <text x="370" y="940" class="label">Knowledge Agent</text>
+  <text x="370" y="962" class="small">知识库、历史经验、RAG</text>
+  <rect x="600" y="915" width="230" height="70" class="chip"/>
+  <text x="625" y="940" class="label">Network Agent</text>
+  <text x="625" y="962" class="small">外部搜索、趋势、竞品信息</text>
+
+  <rect x="980" y="750" width="760" height="300" class="panel-amber box-shadow"/>
+  <text x="1010" y="790" class="section-title">agent/tools</text>
+  <rect x="1010" y="820" width="215" height="58" class="chip"/>
+  <text x="1035" y="845" class="label">DB Tools</text>
+  <text x="1035" y="867" class="small">SQL / workflow</text>
+  <rect x="1250" y="820" width="215" height="58" class="chip"/>
+  <text x="1275" y="845" class="label">RAG Tools</text>
+  <text x="1275" y="867" class="small">knowledge base</text>
+  <rect x="1490" y="820" width="215" height="58" class="chip"/>
+  <text x="1515" y="845" class="label">Search Tools</text>
+  <text x="1515" y="867" class="small">network / Tavily</text>
+  <rect x="1010" y="910" width="215" height="58" class="chip"/>
+  <text x="1035" y="935" class="label">File Tools</text>
+  <text x="1035" y="957" class="small">upload / pdf</text>
+  <rect x="1250" y="910" width="215" height="58" class="chip"/>
+  <text x="1275" y="935" class="label">Markdown Tools</text>
+  <text x="1275" y="957" class="small">report rendering</text>
+  <rect x="1490" y="910" width="215" height="58" class="chip"/>
+  <text x="1515" y="935" class="label">Business Metrics</text>
+  <text x="1515" y="957" class="small">指标计算</text>
+
+  <path d="M1490 700 L1490 750" class="line-green"/>
+  <path d="M1240 900 L880 900" class="line-green"/>
+  <path d="M880 880 L980 880" class="line-green"/>
+
+  <!-- Cross cutting -->
+  <rect x="60" y="1100" width="1680" height="150" class="panel-red box-shadow"/>
+  <text x="90" y="1140" class="section-title">横切能力</text>
+  <rect x="90" y="1168" width="250" height="54" class="chip"/>
+  <text x="115" y="1190" class="label">agent/memory</text>
+  <text x="115" y="1211" class="small">DeepAgents Store 唯一长期记忆</text>
+  <rect x="390" y="1168" width="250" height="54" class="chip"/>
+  <text x="415" y="1190" class="label">agent/trace</text>
+  <text x="415" y="1211" class="small">事件、耗时、慢任务诊断</text>
+  <rect x="690" y="1168" width="250" height="54" class="chip"/>
+  <text x="715" y="1190" class="label">agent/security</text>
+  <text x="715" y="1211" class="small">权限、注入防护、脱敏</text>
+  <rect x="990" y="1168" width="250" height="54" class="chip"/>
+  <text x="1015" y="1190" class="label">agent/evaluation</text>
+  <text x="1015" y="1211" class="small">Critic 质量评估和验收</text>
+  <rect x="1290" y="1168" width="250" height="54" class="chip"/>
+  <text x="1315" y="1190" class="label">agent/reflection</text>
+  <text x="1315" y="1211" class="small">策略复盘、演进日志</text>
+
+  <path d="M215 1168 C215 1080 250 1020 345 985" class="line-soft"/>
+  <path d="M515 1168 C515 1085 645 1040 735 985" class="line-soft"/>
+  <path d="M815 1168 C815 1080 1030 1060 1330 700" class="line-red"/>
+  <path d="M1115 1168 C1115 1070 915 1030 780 985" class="line-purple"/>
+  <path d="M1415 1168 C1415 1080 1390 760 1490 700" class="line-soft"/>
+
+  <!-- Flow legend -->
+  <rect x="1240" y="80" width="500" height="86" class="panel"/>
+  <text x="1265" y="112" class="label">执行策略</text>
+  <text x="1265" y="136" class="small">realtime：Chat Agent 快速回答，p90 目标 &lt; 30s</text>
+  <text x="1265" y="156" class="small">standard：Planner 分派多个业务 subagent，按依赖并行/串行</text>
+</svg>

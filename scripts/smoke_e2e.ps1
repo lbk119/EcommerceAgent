@@ -14,7 +14,7 @@ $ApiBase = "$GatewayUrl/api/v1"
 $RequestTimeoutSec = 120
 $AgentWaitTimeoutSec = 180
 $AgentPollIntervalSec = 5
-$PlanStepSmokeMaxMs = 3000
+$AgentEventSmokeMaxMs = 3000
 $StillRunningMessage = "$([char]0x4EFB)$([char]0x52A1)$([char]0x4ECD)$([char]0x5728)$([char]0x540E)$([char]0x53F0)$([char]0x6267)$([char]0x884C)"
 
 function Fail-Smoke {
@@ -130,17 +130,15 @@ function Assert-ParallelPlanTimeline {
     $events = @($Timeline.events)
     $planStarted = @($events | Where-Object { $_.event_type -eq 'plan_step_started' })
     $started = if ($planStarted.Count -gt 0) { $planStarted } else { @($events | Where-Object { $_.event_type -eq 'workflow_step_started' }) }
-    Assert-True ($started.Count -ge 2) "$TaskName should start at least 2 parallel plan steps, got $($started.Count)"
+    Assert-True ($started.Count -ge 2) "$TaskName should start at least 2 agent/tool events, got $($started.Count)"
     $planFinished = @($events | Where-Object { $_.event_type -eq 'plan_step_finished' })
     $finished = if ($planFinished.Count -gt 0) { $planFinished } else { @($events | Where-Object { $_.event_type -eq 'workflow_step_finished' }) }
     $planFailed = @($events | Where-Object { $_.event_type -eq 'plan_step_failed' })
     $failed = if ($planFailed.Count -gt 0) { $planFailed } else { @($events | Where-Object { $_.event_type -eq 'workflow_step_failed' }) }
     $terminalSteps = @($finished + $failed)
-    Assert-True ($terminalSteps.Count -ge 2) "$TaskName should finish or budget-stop at least 2 parallel plan steps, got $($terminalSteps.Count)"
-    $slowSteps = @($finished | Where-Object { $_.latency_ms -and [double]$_.latency_ms -gt $PlanStepSmokeMaxMs })
-    Assert-True ($slowSteps.Count -eq 0) "$TaskName workflow data read step should be <= ${PlanStepSmokeMaxMs}ms in local smoke; slow steps=$($slowSteps.Count)"
-    $deepEvents = @($events | Where-Object { ([string]$_.event_type) -match 'deepagent|deep_agent' -or ([string]$_.agent_name) -match 'deepagent|deep_agent' })
-    Assert-True ($deepEvents.Count -eq 0) "$TaskName common task trace should not contain DeepAgent events"
+    Assert-True ($terminalSteps.Count -ge 2) "$TaskName should finish or budget-stop at least 2 agent/tool events, got $($terminalSteps.Count)"
+    $slowSteps = @($finished | Where-Object { $_.latency_ms -and [double]$_.latency_ms -gt $AgentEventSmokeMaxMs })
+    Assert-True ($slowSteps.Count -eq 0) "$TaskName agent/tool event should be <= ${AgentEventSmokeMaxMs}ms in local smoke; slow steps=$($slowSteps.Count)"
 }
 
 function Assert-StandardExecutionBudget {
@@ -284,7 +282,7 @@ try {
     Assert-True ($null -ne $seasonMessage) 'AI chat message query returned empty'
     if ($seasonMessage.status -eq 'completed') {
         Assert-True (-not [string]::IsNullOrWhiteSpace($seasonMessage.content)) 'Completed AI chat assistant content is empty'
-        Assert-True ($seasonMessage.source -in @('agent', 'workflow', 'workflow_fast', 'deep_agent')) "Completed AI chat source is invalid: $($seasonMessage.source)"
+        Assert-True ($seasonMessage.source -in @('agent', 'deepagents_native')) "Completed AI chat source is invalid: $($seasonMessage.source)"
         Assert-True ($null -ne $seasonMessage.structuredResult) 'Completed AI chat structuredResult is empty'
         Assert-True (-not [string]::IsNullOrWhiteSpace($seasonMessage.structuredResult.conclusion)) 'Completed AI chat structuredResult.conclusion is empty'
     } else {

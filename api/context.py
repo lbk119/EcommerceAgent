@@ -1,7 +1,7 @@
 from contextvars import ContextVar
 from typing import Optional
 
-from agent.memory.schema import MemoryIdentity
+from agent.memory import MemoryIdentity
 
 # =================================================================================================
 # 核心知识点: ContextVars (上下文变量)

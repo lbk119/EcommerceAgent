@@ -1,8 +1,7 @@
-"""计划式任务执行 profile。
+"""任务执行 profile。
 
-这里的 profile 只服务“计划一次、并行执行、统一汇总”的执行架构，和 DeepAgent 的预算 profile
-互相配合但职责不同：DeepAgent budget 管模型/工具/subagent 调用上限；这里管固定 DAG 的每个 step
-超时、整体超时和 fast model 润色超时。把这些参数集中起来，可以避免不同入口各自散落 magic number。
+这里保留轻量预算配置，供 realtime/standard/deep 三类入口统一读取超时和可选润色策略。
+deepagents-native 的模型、工具和 subagent 调用上限由 agent.runtime.profiles 管理。
 """
 
 from __future__ import annotations
@@ -15,10 +14,10 @@ from agent.runtime.profiles import normalize_runtime_profile
 
 @dataclass(frozen=True)
 class TaskExecutionProfile:
-    """固定 DAG 执行 profile。
+    """入口级执行预算。
 
-    step_timeout_seconds 控制单个并行节点；global_timeout_seconds 控制整个计划；polish_timeout_seconds
-    控制可选 fast model 润色。三者分开可以避免单个慢 SQL 拖垮整体任务。
+    step_timeout_seconds 保留给受控工具调用；global_timeout_seconds 控制入口总耗时；
+    polish_timeout_seconds 控制可选 fast model 润色。
     """
 
     name: str
@@ -31,9 +30,8 @@ class TaskExecutionProfile:
 def get_task_execution_profile(profile: str | None) -> TaskExecutionProfile:
     """返回当前任务的计划执行 profile。
 
-    realtime 面向 AI Chat，需要 8 秒内完成；standard 面向普通数字员工，允许 30 秒但每个数据节点仍默认
-    2 秒，避免单个 SQL 或外部工具拖垮用户体验。deep profile 仍优先使用固定 DAG 覆盖常见任务，但可以
-    给更多整体时间；真正未知任务才 fallback DeepAgent。
+    realtime 面向 AI Chat，只做快速分流和边界/后台任务引导；standard/deep 面向 deepagents-native
+    后台业务任务，允许更长时间但仍保留入口级预算。
     """
     normalized = normalize_runtime_profile(profile)
     if normalized == "realtime":

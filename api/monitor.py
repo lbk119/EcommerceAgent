@@ -138,7 +138,7 @@ class ToolMonitor:
         self._emit("session_created", f"工作目录已创建: {path}", {"path": path})
 
     def emit_assistant_delta(self, *, task_id: str, conversation_id: str, message_id: str, delta: str):
-        """推送 assistant 增量文本；模型暂不支持真 token streaming 时，也可用于 deterministic draft 的分段输出。"""
+        """推送 assistant 增量文本；模型暂不支持真 token streaming 时，也可用于 agent draft 的分段输出。"""
         self._send_chat_event({
             "type": "assistant_delta",
             "taskId": task_id,

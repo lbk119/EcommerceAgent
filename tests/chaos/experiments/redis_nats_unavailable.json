@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "title": "Redis or NATS unavailable",
+  "description": "Stop optional queue backends and verify the gateway health endpoint remains available while queued work fails fast or degrades.",
+  "steady-state-hypothesis": {
+    "title": "health ok; no task remains running forever",
+    "probes": [
+      {"type": "probe", "name": "health-ok", "provider": {"type": "http", "url": "${GATEWAY_URL:-http://127.0.0.1:9090}/health", "timeout": 5}, "tolerance": {"type": "jsonpath", "path": "$.status", "expect": "ok"}}
+    ]
+  },
+  "method": [],
+  "rollbacks": []
+}

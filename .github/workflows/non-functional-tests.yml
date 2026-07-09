@@ -1,0 +1,155 @@
+name: non-functional-tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: Run e2e smoke against GATEWAY_URL
+        required: false
+        default: 'false'
+      gate_mode:
+        description: Non-functional gate mode
+        required: false
+        default: dev
+        type: choice
+        options:
+          - dev
+          - release
+  schedule:
+    - cron: '0 18 * * *'
+
+jobs:
+  unit-python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/run_nonfunctional_suite.py --unit --contract --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-unit-python
+          path: output/nonfunctional
+
+  unit-go:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/run_nonfunctional_suite.py --go --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-unit-go
+          path: output/nonfunctional
+
+  e2e-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_e2e == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/run_nonfunctional_suite.py --e2e --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-e2e
+          path: output/nonfunctional
+
+  evals:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    env:
+      RUN_LIVE_LLM_EVALS: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/run_nonfunctional_suite.py --evals --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-evals
+          path: output/nonfunctional
+
+  security-redteam:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/run_nonfunctional_suite.py --security --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-security
+          path: output/nonfunctional
+
+  perf-chaos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/run_nonfunctional_suite.py --perf --chaos --mode ${{ inputs.gate_mode || 'dev' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-perf-chaos
+          path: output/nonfunctional
+
+  final-summary:
+    if: always()
+    runs-on: windows-latest
+    needs:
+      - unit-python
+      - unit-go
+      - e2e-smoke
+      - evals
+      - security-redteam
+      - perf-chaos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nonfunctional-*
+          path: output/nonfunctional
+          merge-multiple: true
+      - run: python scripts/collect_nonfunctional_report.py --mode ${{ inputs.gate_mode || 'dev' }}
+      - name: Publish non-functional summary
+        shell: pwsh
+        run: |
+          Get-Content output/nonfunctional/summary.md -Encoding UTF8 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonfunctional-final-summary
+          path: output/nonfunctional

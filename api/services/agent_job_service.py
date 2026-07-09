@@ -1,4 +1,4 @@
-"""数字员工任务服务。"""
+"""数字员工任务服务?"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from api.services.agent_job_prompts import build_agent_query
 from api.services.ecommerce_queries import AGENT_DEFINITIONS, normalize_time
 from api.task_queue import task_queue
 from api.task_runtime import task_runtime
-from agent.planning.planner_agent import planner_agent
+from agent.plan.planner import planner_agent
 
 
 def agent_name(agent_id: str) -> str:
@@ -20,7 +20,7 @@ def agent_name(agent_id: str) -> str:
 
 
 async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id: str, payload: dict) -> dict:
-    """创建业务 job，并复用现有 Agent task_queue/task_runtime 执行。"""
+    """创建业务 job，并复用现有 Agent task_queue/task_runtime 执行?"""
     ensure_platform_schema()
     job_type = payload.get("jobType") or payload.get("job_type")
     title = payload.get("title") or job_type or "数字员工任务"
@@ -48,13 +48,13 @@ async def create_agent_job(tenant_id: str, shop_id: str, user_id: str, agent_id:
 
 
 def _runtime_profile_for_job(job_type: str | None) -> str:
-    """数字员工默认走 standard；管理层报告和复杂周期报告才走 deep。"""
+    """数字员工默认?standard；管理层报告和复杂周期报告才?deep?"""
     deep_job_types = {"weekly_report", "monthly_report", "management_report", "strategy_diagnosis", "cross_platform_attribution"}
     return "deep" if str(job_type or "") in deep_job_types else "standard"
 
 
 def _task_plan_for_job(job_type: str | None, query: str, runtime_profile: str):
-    """用稳定 jobType 生成计划，避免内部长 prompt 误命中过多 capability。"""
+    """用稳?jobType 生成计划，避免内部长 prompt 误命中过?capability?"""
     planner_query = {
         "product_optimization": "商品优化",
         "hot_product_analysis": "爆品分析",
@@ -67,10 +67,10 @@ def _task_plan_for_job(job_type: str | None, query: str, runtime_profile: str):
     plan = planner_agent.plan(planner_query, profile=runtime_profile)
     plan_data = plan.to_dict()
     plan_data["raw_query"] = query
-    plan_data["intent"] = {**plan.intent.to_dict(), "raw_query": query, "normalized_query": query}
-    from agent.planning.schemas import TaskPlan
+    plan_data["metadata"] = {**plan.metadata, "normalized_query": query}
+    from agent.plan.models import AgentTaskPlan
 
-    return TaskPlan.from_dict(plan_data)
+    return AgentTaskPlan.from_dict(plan_data)
 
 
 def list_agent_jobs(tenant_id: str, shop_id: str, agent_id: str | None = None) -> list[dict]:
@@ -85,11 +85,7 @@ def list_agent_jobs(tenant_id: str, shop_id: str, agent_id: str | None = None) -
 
 
 async def sync_agent_job_from_runtime(tenant_id: str, shop_id: str, user_id: str, job_id: str) -> None:
-    """当内存任务已结束但业务表仍是 running 时，查询接口做一次轻量同步。
-
-    这主要兜底进程内状态先完成、finalize 写库稍晚的瞬间；如果 task_runtime 没有结果内容，只能把失败
-    同步为 failed，成功仍以 finalize_agent_job_success 写报告为准。
-    """
+    """Lightly sync a running business job from in-memory runtime state."""
     row = fetch_one("SELECT task_id, conversation_id, status FROM agent_jobs WHERE tenant_id=%s AND shop_id=%s AND id=%s", (tenant_id, shop_id, job_id))
     if not row or row.get("status") != "running" or not row.get("task_id"):
         return

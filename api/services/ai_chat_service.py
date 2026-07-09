@@ -1,7 +1,7 @@
 """AI Chat 商业化持久化服务。
 
 这个模块只负责 MySQL 状态，不直接调用模型，也不生成伪回答。AI Chat 的真实执行仍由
-task_queue -> start_agent_task -> run_deep_agent -> AgentRuntime 完成；这里提供三类能力：
+task_queue -> start_agent_task -> run_agent_task -> AgentRuntime 完成；这里提供三类能力：
 1. 接收用户问题时创建 conversation/message/run 记录；
 2. AgentRuntime 完成或失败后回写 assistant 内容和状态；
 3. 前端刷新页面或 WebSocket 断线后查询历史消息和任务状态。

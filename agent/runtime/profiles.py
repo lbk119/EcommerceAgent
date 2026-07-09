@@ -77,7 +77,7 @@ def build_execution_budget(profile: str | None) -> AgentExecutionBudget:
             max_subagent_calls=_int_env("DEEP_AGENT_MAX_SUBAGENT_CALLS", 3),
             max_reflection_retries=_int_env("DEEP_AGENT_MAX_REFLECTION_RETRIES", 1),
             max_critic_revisions=_int_env("DEEP_AGENT_MAX_CRITIC_REVISIONS", 1),
-            allow_network_search=os.getenv("DEEP_AGENT_ENABLE_NETWORK_SEARCH", "false").lower() in {"1", "true", "yes", "on"},
+            allow_network_search=os.getenv("DEEPAGENTS_DEEP_ENABLE_NETWORK_SEARCH", "true").lower() in {"1", "true", "yes", "on"},
             allow_memory_write=True,
             allow_policy_evolution=True,
             allow_human_interrupt=True,

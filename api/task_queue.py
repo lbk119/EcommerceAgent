@@ -16,7 +16,7 @@ class TaskQueue:
         self.backend = os.getenv("TASK_QUEUE_BACKEND", "inline").lower()
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
-        self.queue_name = os.getenv("TASK_QUEUE_NAME", "deepagent.tasks")
+        self.queue_name = os.getenv("TASK_QUEUE_NAME", "agent.tasks")
         self.max_concurrency = max(1, int(os.getenv("MAX_AGENT_CONCURRENCY", "10")))
         self.profile_concurrency = {
             "realtime": max(1, int(os.getenv("REALTIME_AGENT_CONCURRENCY", "8"))),
@@ -30,7 +30,7 @@ class TaskQueue:
         self._running_tasks: set[asyncio.Task] = set()
 
     async def start(self, handler: TaskHandler) -> None:
-        # Semaphore 绑定当前事件循环；服务启动时创建，避免模块导入阶段触碰 event loop。
+        # Semaphore 绑定当前事件循环；服务启动时创建，避免模块导入阶段触?event loop?
         self._semaphore = asyncio.Semaphore(self.max_concurrency)
         self._profile_semaphores = {profile: asyncio.Semaphore(limit) for profile, limit in self.profile_concurrency.items()}
         if self.backend == "inline":
@@ -90,29 +90,29 @@ class TaskQueue:
         try:
             from redis.asyncio import from_url
         except ImportError as exc:
-            raise RuntimeError("启用 Redis 队列需要安装 redis 包") from exc
+            raise RuntimeError("启用 Redis 队列需要安?redis ?") from exc
         return from_url(self.redis_url, decode_responses=True)
 
     async def _nats_client(self):
         try:
             from nats import connect
         except ImportError as exc:
-            raise RuntimeError("启用 NATS 队列需要安装 nats-py 包") from exc
+            raise RuntimeError("启用 NATS 队列需要安?nats-py ?") from exc
         return await connect(self.nats_url)
 
     def _schedule_handler(self, handler: TaskHandler, payload: dict) -> None:
         """
-        创建受控后台任务，并保留引用直到任务结束。
+        创建受控后台任务，并保留引用直到任务结束?
 
-        直接 asyncio.create_task(handler(payload)) 会让异常只出现在事件循环日志里，并且任务对象可能被
-        GC；这里统一走 _run_handler_safely，确保并发上限、异常记录和任务引用清理都有明确位置。
+        直接 asyncio.create_task(handler(payload)) 会让异常只出现在事件循环日志里，并且任务对象可能?
+        GC；这里统一?_run_handler_safely，确保并发上限、异常记录和任务引用清理都有明确位置?
         """
         task = asyncio.create_task(self._run_handler_safely(handler, payload))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
     def stats(self) -> dict:
-        """返回任务队列的真实运行状态，供 /agent-runtime/health 展示。"""
+        """返回任务队列的真实运行状态，?/agent-runtime/health 展示?"""
         queued = self._inline_queue.qsize() if self.backend == "inline" else None
         return {
             "status": "ok" if self._worker_task and not self._worker_task.done() else "not_started",
@@ -125,10 +125,10 @@ class TaskQueue:
 
     async def _run_handler_safely(self, handler: TaskHandler, payload: dict) -> None:
         """
-        在 MAX_AGENT_CONCURRENCY 限制下执行任务 handler。
+        ?MAX_AGENT_CONCURRENCY 限制下执行任?handler?
 
-        handler 必须等待真实 Agent 任务结束后再返回；这样 semaphore 限制的是运行中的 Agent 数量，
-        不是“启动任务”的瞬时数量。任何异常都会被记录到日志和 trace，但不会杀死队列 worker。
+        handler 必须等待真实 Agent 任务结束后再返回；这?semaphore 限制的是运行中的 Agent 数量?
+        不是“启动任务”的瞬时数量。任何异常都会被记录到日志和 trace，但不会杀死队?worker?
         """
         semaphore = self._semaphore
         if semaphore is None:
@@ -153,9 +153,9 @@ class TaskQueue:
                 self._trace_handler_failure(payload, error)
 
     def _trace_handler_failure(self, payload: dict, error: Exception) -> None:
-        """任务队列异常 trace；懒加载 tracer，避免轻量导入 api.task_queue 时拉入观测写入器。"""
+        """任务队列异常 trace；懒加载 tracer，避免轻量导?api.task_queue 时拉入观测写入器?"""
         try:
-            from agent.observability.tracer import tracer
+            from agent.trace.tracer import tracer
 
             task_id = payload.get("task_id") or payload.get("thread_id") or payload.get("conversation_id") or "unknown"
             tracer.emit(
@@ -172,7 +172,7 @@ class TaskQueue:
 
     def _profile_for_payload(self, payload: dict) -> str:
         if payload.get("source") == "ai_chat":
-            return "realtime"
+            return normalize_runtime_profile(payload.get("runtime_profile") or payload.get("profile") or "realtime")
         return normalize_runtime_profile(payload.get("runtime_profile") or payload.get("profile") or "standard")
 
 

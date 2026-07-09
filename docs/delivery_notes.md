@@ -9,27 +9,27 @@
 - 示例数据导入：写入订单、商品、库存、流量、活动、退款等测试数据。
 - CSV/Excel 上传导入：上传、预览、确认入库、刷新工作台。
 - 数据导入后经营闭环：生成经营概览报告和待审核策略。
-- 数字员工任务：创建 `agent_jobs`，通过 `task_queue -> start_agent_task -> run_deep_agent -> AgentRuntime` 执行，成功/失败回写业务 job。
+- 数字员工任务：创建 `agent_jobs`，通过 `task_queue -> start_agent_task -> run_agent_task -> AgentRuntime` 执行，成功/失败回写业务 job。
 - 报告中心：生成草稿报告、Agent 完成后更新报告内容、报告详情查询；Plan-first 任务会同时保存 `structuredResult`，前端优先用结论、依据、动作、风险、缺失数据和执行明细卡片展示，Markdown 仅作为原文查看/复制/导出格式。
 - 商品分析、库存补货建议、活动复盘：前端按钮接 Gateway，Gateway 代理 Brain，Brain 创建受控 Agent job。
 - AI 对话：前端请求 `POST /api/v1/ai-chat/messages`，Gateway 代理到 Python Brain 的 `/api/ai-chat/messages`；Brain 只做鉴权上下文、任务分类、MySQL run/message 创建和入队，目标是在 1 秒内返回 `status=running` 的任务受理结果。
-- AI 对话执行：后台 `task_queue -> start_agent_task -> ChatAgentRuntime` 继续运行，AI Chat 不再导入 `agent.main_agent` 或构建完整 DeepAgent；完成/失败/超时后回写 MySQL `ai_chat_messages` 与 `ai_chat_runs`，前端不再同步等待 60 秒，也不会停在“正在调用 Python Brain AgentRuntime 分析...”。
+- AI 对话执行：后台 `task_queue -> start_agent_task -> AgentRuntime -> deepagents-native realtime profile` 继续运行，AI Chat 不再使用独立聊天运行时；完成/失败/超时后回写 MySQL `ai_chat_messages` 与 `ai_chat_runs`，前端不再同步等待 60 秒，也不会停在“正在调用 Python Brain AgentRuntime 分析...”。
 - AI 对话观测：前端使用同一个 `conversationId/wsThreadId` 连接 Gateway `/api/v1/ws/{thread_id}`，实时展示后端 trace 事件；断线或刷新后通过 `/api/v1/ai-chat/tasks/{task_id}/timeline` 和 `/api/v1/ai-chat/messages/{message_id}` 补拉状态。
 - AI 对话体验：前端拆成左侧对话和右侧 Agent 状态面板，助手消息展示答案、可折叠分析过程、状态、耗时、来源；WebSocket 事件按“接收问题、识别意图、读取店铺数据、命中工作流、生成建议、质量检查、写入结果、完成”等阶段聚合，默认只展示当前阶段和最近关键事件。
 - AI 对话并发：同一 `conversationId` 内允许多个后台任务并行运行，生命周期隔离改由唯一 `task_id` 承担；用户在长任务运行时可以继续提交下一问，不再因为同会话已有任务而返回 409。
-- AI 对话性能：高频经营问题优先走 `workflow_fast`，SQL workflow 节点使用并行读取，deterministic draft 会先通过 `assistant_delta` 推给前端，LLM 只做快速润色；`AI_CHAT_MODEL_PROFILE=fast`、`AI_CHAT_LLM_TIMEOUT_SECONDS=8`、`AI_CHAT_LLM_MAX_RETRIES=1`、`AI_CHAT_TOTAL_TARGET_SECONDS=15`、`AI_CHAT_DEEPAGENT_ENABLED=false` 用于约束 AI Chat 的成本和等待时间。
+- AI 对话性能：高频经营问题在 AI Chat 中快速分流，复杂分析转入后台 standard/deep job；standard/deep 由 deepagents-native subagents 理解参数、选择授权工具并基于真实工具结果分析；模型或工具异常时返回 degraded/clarification；`AI_CHAT_MODEL_PROFILE=fast`、`AI_CHAT_LLM_TIMEOUT_SECONDS=8`、`AI_CHAT_TOTAL_TARGET_SECONDS=15` 用于约束 AI Chat 的成本和等待时间。
 - AI 对话规划：HTTP 受理阶段用 PlannerAgent 同步 fallback 生成轻量 `task_plan`，入队 payload 保留 `raw_user_question`、`task_plan` 和 `agent_query`；包装 prompt 不再参与规划，避免“天气”被包装词里的库存、商品、活动误判成业务 workflow。
 - AI 对话持久化：新增 MySQL `ai_chat_conversations`、`ai_chat_messages`、`ai_chat_runs`；完成消息保存 `structured_json` 并返回 `structuredResult`，刷新后可从后端恢复历史消息、任务状态和已完成结构化结果。
-- AgentRuntime profiles：新增 `realtime`、`standard`、`deep` 三档运行时。`realtime` 由 ChatAgentRuntime 承接，不构建 DeepAgent；`standard` 用 slim DeepAgent + workflow 优先 + 受控预算；`deep` 才允许完整 DeepAgent、可选知识库/网络搜索、Critic、Memory、Evolution。
+- AgentRuntime profiles：新增 `realtime`、`standard`、`deep` 三档运行时。`realtime` 由 deepagents-native main agent 承接，但不挂工具和 subagents；`standard` 和 `deep` 统一走 deepagents-native main agent + business subagents；`deep` 允许更高预算、网络搜索、Critic、Memory、Evolution。
 - AgentRuntime budget：新增模型/工具/subagent/wall time 硬预算，默认 realtime 为 15s/1 model/3 tools/0 subagents，standard 为 45s/2 models/6 tools/1 subagent，deep 为 180s/6 models/12 tools/3 subagents；超预算会写入 `budget_exceeded` trace 并返回阶段性结果。
-- Plan-first 并行执行：新增 `PlanRegistry -> ParallelExecutor -> Reducer`，商品/库存/活动/日报等常见电商任务先由规则 Planner 一次性生成固定 DAG，互不依赖的查询节点通过 `asyncio.gather`/并行任务执行；每个 step 返回结构化 JSON，Reducer 先生成 deterministic conclusion/evidence/actions/risks/missingData，fast model 只做可选润色，超时直接返回确定性结果。
-- Agent 模块瘦身：`agent/workflows/workflow_runner.py` 只保留路由、PlanRegistry 调用、并行执行和 Reducer 汇总职责；旧 descriptor workflow 文件已删除，输出要求统一沉淀在 `agent/runtime/plan_registry.py`。
-- Optional extensions：知识库 subagent、网络搜索 subagent、Milvus/BGE 语义记忆和 checkpointer 已移到 `agent_extensions/`，默认不在 realtime/standard 热路径导入；仅 deep profile 且开启 `DEEP_AGENT_ENABLE_KNOWLEDGE_BASE`、`DEEP_AGENT_ENABLE_NETWORK_SEARCH`、`MEMORY_VECTOR_SEARCH_ENABLED`、`MEMORY_VECTOR_WRITE_ENABLED` 等环境变量时启用。
-- Plan timeout：默认 realtime 每 step 2s、全局 8s、polish 3s；standard 每 step 2s、全局 30s、polish 6s；deep 每 step 3s、全局 60s、polish 8s。realtime/standard 默认 `*_PLAN_FAST_POLISH=false`，先返回确定性结论；有稳定 fast model 时可打开润色。DeepAgent 只作为未知复杂任务或关键计划节点失败后的受控 fallback。
+- deepagents-native 业务执行：PlannerAgent 输出 `AgentTaskPlan` 和 `AgentAssignment`，只负责分派 Product/Inventory/Campaign/Report/DataQuality/KnowledgeBase/NetworkSearch/DatabaseQuery 等业务 subagent；deepagents main agent 根据依赖关系委托 subagents，并通过 `agent/tools` 注册工具和权限边界执行。
+- Agent 模块瘦身：旧固定执行层已从主链路移除并删除；Runtime、AI Chat、Agent Job 和 API 队列全部使用 `AgentTaskPlan`。
+- Optional extensions：Milvus/BGE 语义记忆和 checkpointer 保留在 `agent/subagent/checkpoint.py`；知识库和网络搜索 subagent 已进入 `agent/subagent/subagents.py`，由 profile 和 `DEEPAGENTS_DEEP_ENABLE_NETWORK_SEARCH` 控制。
+- Runtime guard：deepagents-native 使用 RuntimeGuard/profile budget 控制模型、工具、subagent 调用次数和 wall time，替代旧固定 step executor/loop_guard。
 - Task queue profile 并发：后台队列在总并发 `MAX_AGENT_CONCURRENCY=10` 外，再按 `REALTIME_AGENT_CONCURRENCY`、`STANDARD_AGENT_CONCURRENCY`、`DEEP_AGENT_CONCURRENCY` 做 profile semaphore，默认 realtime=8、standard=2、deep=1，避免深度任务无预算挤占实时体验。
-- AgentRuntime health/metrics：新增 `/api/v1/agent-runtime/health`、`/api/v1/agent-runtime/metrics` 与 `/api/v1/agent-runtime/slow-tasks`，health 区分 `ok`、`disabled`、`not_started`、`jsonl_not_mysql`，不把未接入模块伪装成健康；慢任务接口用于排查 trace 中的高耗时 LLM、workflow 或 DeepAgent 阶段。
+- AgentRuntime health/metrics：新增 `/api/v1/agent-runtime/health`、`/api/v1/agent-runtime/metrics` 与 `/api/v1/agent-runtime/slow-tasks`，health 区分 `ok`、`disabled`、`not_started`、`jsonl_not_mysql`，不把未接入模块伪装成健康；慢任务接口用于排查 trace 中的高耗时 LLM、subagent 或 deepagents-native 阶段。
 - AgentRuntime diagnosis：新增 `/api/v1/agent-runtime/tasks/{task_id}/diagnosis`，按单任务返回总耗时、模型调用、工具调用、subagent 调用、Critic/Memory 事件、最慢阶段和优化建议。
-- Agent 模块审计：新增 `scripts/audit_agent_modules.ps1`，输出每个 `agent`/`agent_extensions` Python 文件的模块分类、引用数量、是否热路径和治理建议。
+- Agent 模块审计：新增 `scripts/audit_agent_modules.ps1`，输出每个 `agent`/`agent/subagent/checkpoint.py` Python 文件的模块分类、引用数量、是否热路径和治理建议。
 - 任务治理：AI Chat 提供 `POST /api/v1/ai-chat/tasks/{task_id}/cancel`，可取消 queued/running 任务并回写 MySQL 状态；已完成、失败或超时的任务保持终态不被覆盖。
 - 策略审核：approve/reject/defer 均按租户和店铺更新，不存在的 strategy 返回 404。
 - Gateway API 治理：业务路由经过 Auth -> Tenant -> Casbin；新注册 admin 注入当前业务路由权限。
@@ -39,16 +39,16 @@
 
 - JSON / memory 用户存储仅用于本地开发或测试显式启用；商业化默认用户存储是 MySQL，不再使用 `data/gateway_users.json`。
 
-- 工作台指标、商品分层、库存风险、活动评分和活动结论主要由 SQL 聚合和确定性规则生成。
+- 工作台指标、商品分层、库存风险和活动评分的数据来源主要由 SQL 聚合和确定性工具生成；deepagents-native subagent 的工具选择、参数理解和结论分析由 LLM 主导，并受工具 schema 与权限约束。
 - 导入后经营概览和策略候选由确定性模板生成，适合验收闭环，不代表最终智能策略质量。
 - SQL 聚合保留为 Agent workflow 节点和数据库工具的数据来源，不再由 AI Chat API route 直接拼接固定答案。
 - 导入后经营概览仍是确定性摘要，用于数据接入后的快速反馈，不代表 Agent 深度分析。
 - 前端 AI 对话已移除本地伪回答 fallback；后端 AI Chat route 不再拼 SQL 固定回答。模型或 API key 未配置时，AI 对话会保留任务状态并显示真实失败/超时。
-- AI Chat 默认使用 `runtime_profile=realtime`：由 ChatAgentRuntime 承接，优先 workflow-first，不导入或构建 DeepAgent；standard/realtime 默认跳过 Critic、长期记忆和结果 enrichment，deep profile 才启用完整 Runtime。
+- AI Chat 默认使用 `runtime_profile=realtime`：由 deepagents-native realtime main agent 承接，无工具、无 subagents、短预算；standard/realtime 默认跳过 Critic、长期记忆和结果 enrichment，deep profile 才启用完整 Runtime。
 
 ## 依赖真实模型或平台授权的能力
 
-- 数字员工最终报告质量依赖 `agent.main_agent.run_deep_agent` 的模型调用和工具执行结果。
+- 数字员工最终报告质量依赖 `agent.main_agent.run_agent_task` 的模型调用和工具执行结果。
 - 商品优化、补货计划、活动复盘的深度分析依赖模型可用性、工具链稳定性和数据质量。
 - 真实平台授权、订单同步、库存同步、活动同步仍需要接入平台开放 API。
 - 多平台增量同步、授权过期刷新、失败重试和同步日志仍需要真实平台环境验证。

@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "title": "LLM adapter timeout degrades agent task",
+  "description": "Inject an LLM timeout and verify submitted work reaches failed or timeout instead of staying running.",
+  "steady-state-hypothesis": {
+    "title": "gateway remains healthy and tasks terminate",
+    "probes": [
+      {"type": "probe", "name": "health-ok", "provider": {"type": "http", "url": "${GATEWAY_URL:-http://127.0.0.1:9090}/health", "timeout": 5}, "tolerance": {"type": "jsonpath", "path": "$.status", "expect": "ok"}}
+    ]
+  },
+  "method": [
+    {"type": "action", "name": "enable-llm-timeout", "provider": {"type": "process", "path": "powershell", "arguments": "-NoProfile -Command \"$env:PLANNER_AGENT_TIMEOUT_SECONDS='0.001'\""}}
+  ],
+  "rollbacks": []
+}

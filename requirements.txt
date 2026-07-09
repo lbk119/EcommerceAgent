@@ -6,6 +6,8 @@ langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-community>=0.2.0
 langgraph>=0.1.0
+langgraph-checkpoint-postgres>=3.0.0
+langgraph-checkpoint-redis>=0.5.0
 
 # --- LLM Services ---
 langchain-openai>=0.1.0
@@ -43,3 +45,10 @@ PyYAML>=6.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 typing-extensions>=4.5.0
+
+# --- Test & Evaluation Tooling ---
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+respx>=0.21.0
+httpx>=0.27.0
+pytest-timeout>=2.3.0
