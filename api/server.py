@@ -30,6 +30,8 @@ from agent.trace.reader import build_agent_metrics, build_slow_tasks, build_task
 from agent.trace.tracer import tracer
 from agent.trace.slow_task_analyzer import diagnose_task
 from agent.runtime.profiles import normalize_runtime_profile
+from api.sandbox import server as sandbox
+from api.sandbox.docker_runner import docker_available
 from api.routes import agents, ai_chat, campaigns, dashboard, data_import, integrations, inventory, onboarding, products, reports, shops, workspace
 
 app = FastAPI(title="DeepAgents API")
@@ -48,6 +50,7 @@ app.include_router(shops.router)
 app.include_router(integrations.router)
 app.include_router(onboarding.router)
 app.include_router(ai_chat.router)
+app.include_router(sandbox.router)
 
 # 挂载输出目录，以便前端访问生成的静态文?
 # 假设输出目录位于项目根目录下?output
@@ -143,6 +146,12 @@ async def startup_event():
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
     ensure_platform_schema()
+    sandbox_enabled = os.getenv("ENABLE_DOCKER_SANDBOX", "true").lower() in {"1", "true", "yes", "on"}
+    docker_ready = docker_available()
+    if sandbox_enabled and not docker_ready:
+        if os.getenv("APP_ENV", "dev").lower() in {"prod", "production"}:
+            raise RuntimeError("ENABLE_DOCKER_SANDBOX=true but Docker is unavailable")
+        print("[Sandbox] Docker is unavailable; sandbox Docker tests will skip and sandbox executions will be denied.")
     await task_queue.start(start_agent_task)
     print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
 
@@ -467,6 +476,12 @@ async def get_agent_runtime_health(http_request: Request):
             "policyProposalEnabled": True,
             "status": "jsonl_not_mysql",
             "pendingProposals": pending_proposals,
+        },
+        "sandbox": {
+            "enabled": os.getenv("ENABLE_DOCKER_SANDBOX", "true").lower() in {"1", "true", "yes", "on"},
+            "dockerAvailable": docker_available(),
+            "root": os.getenv("SANDBOX_ROOT", "output/sandbox"),
+            "networkEnabled": os.getenv("SANDBOX_ENABLE_NETWORK", "false").lower() in {"1", "true", "yes", "on"},
         },
     }
 

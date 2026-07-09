@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from api.context import reset_session_context, set_identity_context, set_session_context, set_thread_context
+from api.context import reset_sandbox_context, reset_session_context, set_identity_context, set_sandbox_context, set_session_context, set_thread_context
 from api.monitor import monitor
 from agent.memory import MemoryIdentity
 
@@ -46,10 +46,13 @@ class TaskRunContext:
     session_dir_token: Any
     thread_token: Any
     identity_token: Any
+    sandbox_token: Any = None
 
     def cleanup(self) -> None:
         """释放 ContextVar token，防止当前任务上下文污染后续请求。"""
         reset_session_context(self.session_dir_token, self.thread_token, self.identity_token)
+        if self.sandbox_token is not None:
+            reset_sandbox_context(self.sandbox_token)
 
 
 def build_task_context(
@@ -59,6 +62,7 @@ def build_task_context(
     tenant_id: str,
     user_id: str,
     shop_id: str,
+    runtime_profile: str = "standard",
 ) -> TaskRunContext:
     """
     准备 Agent 执行所需的全部运行上下文。
@@ -84,6 +88,15 @@ def build_task_context(
     session_dir_token = set_session_context(session_dir_str)
     thread_token = set_thread_context(conversation_id)
     identity_token = set_identity_context(identity)
+    sandbox_token = set_sandbox_context({
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "shop_id": shop_id,
+        "task_id": task_id,
+        "conversation_id": conversation_id,
+        "profile": runtime_profile,
+        "agent_id": "main_agent",
+    })
     monitor.report_session_dir(session_dir_str)
 
     config = {
@@ -113,6 +126,7 @@ def build_task_context(
         session_dir_token=session_dir_token,
         thread_token=thread_token,
         identity_token=identity_token,
+        sandbox_token=sandbox_token,
     )
 
 

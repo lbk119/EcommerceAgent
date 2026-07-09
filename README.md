@@ -356,6 +356,70 @@ reflection 不直接改变高风险策略。需要审批的策略候选会进入
 - 商品/库存/活动/报告后台任务：`standard`
 - 需要外部趋势、复杂多轮分析、跨模块依赖：`deep`
 
+## Docker 沙箱机制
+
+EcommerceAgent 支持容器级 Agent Sandbox，用于隔离文件解析、用户上传文件处理、潜在代码执行和后续第三方脚本类工具。链路是：
+
+```text
+Agent Runtime / subagent tool
+  -> agent.sandbox.SandboxClient
+  -> POST /api/v1/sandbox/execute
+  -> api.sandbox Sandbox Server
+  -> 临时 Docker container
+  -> 收集 /workspace/output
+  -> 销毁容器和 workspace
+```
+
+Agent、subagent 和 tool 侧不直接 import Docker SDK，也不调用 Docker CLI；它们只能提交 `SandboxTask`。Docker 容器创建、资源限制、网络策略、挂载策略和审计都由 `api/sandbox` 内部服务端模块完成。
+
+默认限制：
+
+| Profile | Sandbox 能力 |
+| --- | --- |
+| `realtime` | 禁止所有容器执行，即使工具误传入也拒绝。 |
+| `standard` | 允许受控 Python/file 任务；默认禁止 shell、网络、数据库凭证进入容器。 |
+| `deep` | 允许 Python/Node/file；shell 仍需 `SANDBOX_ENABLE_SHELL=true`；网络默认关闭，只能通过 allowlist 策略启用。 |
+
+容器安全参数包括：默认无网络、非 root 用户 `1000:1000`、`--read-only` rootfs、`/tmp` tmpfs、只挂载单任务 workspace 到 `/workspace`、`--cap-drop ALL`、`no-new-privileges`、内存/CPU/pids/timeout 限制。禁止 Docker socket、host network、host pid、privileged container 和宿主敏感路径挂载。
+
+构建沙箱镜像：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_sandbox_images.ps1
+```
+
+当前已实际接入的 sandbox 工具：`read_file_content`。该工具会把用户会话目录中的目标文件复制成 `SandboxFile`，由 Python 沙箱容器解析文本/CSV/Excel，不再在 Agent 进程内直接解析上传文件。数据库只读业务工具仍 native 执行，但保留权限、SQL guard 和 ToolRegistry metadata。长期记忆仍只走 DeepAgents Store，不进入容器。
+
+Trace 中可查看 `sandbox_task_requested`、`sandbox_task_denied`、`sandbox_container_created`、`sandbox_task_finished`、`sandbox_task_failed`、`sandbox_container_removed`。Docker 不可用或镜像未构建时，Docker runner/e2e 相关测试会 skip；非 Docker 的模型、策略和 workspace 测试仍会执行。
+
+常用沙箱配置：
+
+```env
+ENABLE_DOCKER_SANDBOX=true
+SANDBOX_SERVER_INTERNAL_TOKEN=dev-sandbox-token-change-me
+SANDBOX_ROOT=output/sandbox
+SANDBOX_KEEP_WORKSPACE_ON_FAILURE=false
+SANDBOX_DEFAULT_TIMEOUT_SECONDS=30
+SANDBOX_MAX_TIMEOUT_SECONDS=120
+SANDBOX_DEFAULT_MEMORY_MB=512
+SANDBOX_DEEP_MEMORY_MB=1024
+SANDBOX_DEFAULT_CPU_COUNT=1
+SANDBOX_DEEP_CPU_COUNT=2
+SANDBOX_PIDS_LIMIT=128
+SANDBOX_MAX_INPUT_BYTES=10485760
+SANDBOX_MAX_OUTPUT_BYTES=10485760
+SANDBOX_ENABLE_NETWORK=false
+SANDBOX_DEEP_ENABLE_NETWORK=false
+SANDBOX_ALLOWED_DOMAINS=
+SANDBOX_ENABLE_SHELL=false
+SANDBOX_PYTHON_IMAGE=ecommerce-agent-sandbox-python:latest
+SANDBOX_NODE_IMAGE=ecommerce-agent-sandbox-node:latest
+```
+
+`/api/v1/sandbox/*` 是 Brain 内部接口，不应作为普通前端功能暴露；调用方必须携带 `X-Sandbox-Internal-Token`。生产环境必须替换默认 token，并在网关或部署层限制该接口只允许内部服务访问。
+
+详细协议和扩展方式见 [docs/docker_sandbox.md](docs/docker_sandbox.md)。
+
 ## 运行说明
 
 ### 环境要求

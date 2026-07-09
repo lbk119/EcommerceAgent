@@ -39,6 +39,14 @@ class DeepAgentsProfileConfig:
     allow_memory_write: bool
     enable_hitl: bool
     enable_guard: bool
+    enable_docker_sandbox: bool
+    allow_sandbox_python: bool
+    allow_sandbox_node: bool
+    allow_sandbox_shell: bool
+    allow_sandbox_network: bool
+    sandbox_timeout_seconds: int
+    sandbox_memory_mb: int
+    sandbox_cpu_count: float
 
 
 def deepagents_enabled(profile: str | None = None) -> bool:
@@ -78,6 +86,14 @@ def get_deepagents_profile(profile: str | None) -> DeepAgentsProfileConfig:
             allow_memory_write=False,
             enable_hitl=False,
             enable_guard=flag("ENABLE_AGENT_SAFETY_MIDDLEWARE", True),
+            enable_docker_sandbox=flag("ENABLE_DOCKER_SANDBOX", True),
+            allow_sandbox_python=False,
+            allow_sandbox_node=False,
+            allow_sandbox_shell=False,
+            allow_sandbox_network=False,
+            sandbox_timeout_seconds=0,
+            sandbox_memory_mb=0,
+            sandbox_cpu_count=0,
         )
     if name == "deep":
         return DeepAgentsProfileConfig(
@@ -101,6 +117,14 @@ def get_deepagents_profile(profile: str | None) -> DeepAgentsProfileConfig:
             allow_memory_write=flag("ENABLE_DEEPAGENTS_MEMORY", True),
             enable_hitl=flag("ENABLE_DEEPAGENTS_HITL", True),
             enable_guard=flag("ENABLE_AGENT_SAFETY_MIDDLEWARE", True),
+            enable_docker_sandbox=flag("ENABLE_DOCKER_SANDBOX", True),
+            allow_sandbox_python=True,
+            allow_sandbox_node=True,
+            allow_sandbox_shell=flag("SANDBOX_ENABLE_SHELL", False) or flag("ENABLE_SANDBOX_SHELL", False),
+            allow_sandbox_network=flag("SANDBOX_DEEP_ENABLE_NETWORK", False),
+            sandbox_timeout_seconds=int_env("SANDBOX_MAX_TIMEOUT_SECONDS", 120),
+            sandbox_memory_mb=int_env("SANDBOX_DEEP_MEMORY_MB", 1024),
+            sandbox_cpu_count=float_env("SANDBOX_DEEP_CPU_COUNT", 2),
         )
     return DeepAgentsProfileConfig(
         name="standard",
@@ -123,6 +147,14 @@ def get_deepagents_profile(profile: str | None) -> DeepAgentsProfileConfig:
         allow_memory_write=flag("ENABLE_DEEPAGENTS_MEMORY", True),
         enable_hitl=flag("ENABLE_DEEPAGENTS_HITL", True),
         enable_guard=flag("ENABLE_AGENT_SAFETY_MIDDLEWARE", True),
+        enable_docker_sandbox=flag("ENABLE_DOCKER_SANDBOX", True),
+        allow_sandbox_python=True,
+        allow_sandbox_node=False,
+        allow_sandbox_shell=False,
+        allow_sandbox_network=False,
+        sandbox_timeout_seconds=int_env("SANDBOX_DEFAULT_TIMEOUT_SECONDS", 30),
+        sandbox_memory_mb=int_env("SANDBOX_DEFAULT_MEMORY_MB", 512),
+        sandbox_cpu_count=float_env("SANDBOX_DEFAULT_CPU_COUNT", 1),
     )
 
 

@@ -11,6 +11,7 @@
 注意：ToolSpec.name 应当和 LangChain tool 的名称保持一致，便于追踪和权限拦截。
 """
 
+import json
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any, Callable, Dict, List, Optional
@@ -41,6 +42,14 @@ class ToolSpec:
     permissions: List[str] = field(default_factory=list)
     requires_human_approval: bool = False
     description: str = ""
+    execution_mode: str = "native"
+    sandbox_runtime: Optional[str] = None
+    sandbox_required: bool = False
+    allowed_profiles: List[str] = field(default_factory=lambda: ["standard", "deep"])
+    needs_network: bool = False
+    needs_filesystem: bool = False
+    needs_database: bool = False
+    needs_memory: bool = False
 
 
 class ToolRegistry:
@@ -109,6 +118,19 @@ class ToolRegistry:
         sync_func = getattr(original_tool, "func", None)
         async_func = getattr(original_tool, "coroutine", None)
 
+        if spec.sandbox_required or spec.execution_mode == "sandbox":
+            def sandbox_func(*args, **kwargs):
+                check_permission()
+                return _execute_sandbox_tool(spec, kwargs, actor)
+
+            return StructuredTool.from_function(
+                func=sandbox_func,
+                name=getattr(original_tool, "name", spec.name),
+                description=getattr(original_tool, "description", spec.description),
+                args_schema=getattr(original_tool, "args_schema", None),
+                return_direct=getattr(original_tool, "return_direct", False),
+            )
+
         def guarded_func(*args, **kwargs):
             # 权限检查放在每次实际调用前，而不是挂载工具时，避免缓存绕过权限变化。
             check_permission()
@@ -143,6 +165,15 @@ class ToolRegistry:
                 "permissions": spec.permissions,
                 "requires_human_approval": spec.requires_human_approval,
                 "description": spec.description,
+                "execution_mode": spec.execution_mode,
+                "sandbox_runtime": spec.sandbox_runtime,
+                "sandbox_required": spec.sandbox_required,
+                "allowed_profiles": spec.allowed_profiles,
+                "risk_level": spec.risk,
+                "needs_network": spec.needs_network,
+                "needs_filesystem": spec.needs_filesystem,
+                "needs_database": spec.needs_database,
+                "needs_memory": spec.needs_memory,
             }
             for spec in self._specs.values()
         ]
@@ -165,6 +196,134 @@ def _lazy_tool(module_path: str, attr_name: str) -> Callable[[], Any]:
 
     return load_tool
 
+
+def _metadata_only_tool(name: str) -> Callable[[], Any]:
+    """Factory for tools whose execution is owned by deepagents-native wrappers."""
+    def load_tool() -> Any:
+        from langchain_core.tools import StructuredTool
+
+        def unavailable(**kwargs):
+            raise RuntimeError(f"{name} is metadata-only; use agent.subagent.tools native wrapper")
+
+        return StructuredTool.from_function(func=unavailable, name=name, description=f"metadata-only tool {name}")
+
+    return load_tool
+
+
+def _execute_sandbox_tool(spec: ToolSpec, params: dict[str, Any], actor: str) -> Any:
+    """Execute sandbox-required tools through SandboxClient."""
+    from api.context import get_sandbox_context, get_session_context
+    from agent.security.prompt_guard import sanitize_prompt_text
+    from agent.security.redaction import redact_secrets
+    from agent.sandbox.client import SandboxClient
+    from agent.sandbox.errors import SandboxUnavailableError
+    from agent.sandbox.models import SandboxFile, SandboxResourceLimits, SandboxTask
+    from agent.trace.tracer import tracer
+    from api.sandbox.workspace import WorkspaceSecurityError, validate_relative_path
+    from utils.path_utils import resolve_path
+    from pathlib import Path
+
+    sandbox_context = get_sandbox_context()
+    profile = str(sandbox_context.get("profile") or "standard")
+    if profile == "realtime":
+        return _tool_sandbox_error(spec.name, "realtime profile cannot execute tools")
+    if spec.name != "read_file_content":
+        return _tool_sandbox_error(spec.name, "sandbox adapter is not implemented for this tool")
+
+    filename = str(params.get("filename") or params.get("path") or "").strip()
+    instruction = str(params.get("instruction") or "提取全部内容")
+    try:
+        safe_relative = validate_relative_path(filename)
+    except WorkspaceSecurityError as error:
+        tracer.emit(
+            "sandbox_task_denied",
+            trace_id=str(sandbox_context.get("task_id") or ""),
+            task_id=str(sandbox_context.get("task_id") or ""),
+            conversation_id=str(sandbox_context.get("conversation_id") or ""),
+            agent_name=actor,
+            metadata={"tool_name": spec.name, "denied_reason": str(error), "profile": profile},
+        )
+        return _tool_sandbox_error(spec.name, str(error))
+
+    try:
+        session_dir = get_session_context()
+        if not session_dir:
+            return _tool_sandbox_error(spec.name, "session directory is not available")
+        host_path = Path(resolve_path(safe_relative, session_dir))
+        input_file = SandboxFile.from_bytes(f"input/{safe_relative}", host_path.read_bytes())
+        timeout_seconds = int(sandbox_context.get("sandbox_timeout_seconds") or 30)
+        task = SandboxTask(
+            task_id=str(sandbox_context.get("task_id") or SandboxTask.new_id()),
+            conversation_id=str(sandbox_context.get("conversation_id") or sandbox_context.get("task_id") or "sandbox"),
+            tenant_id=str(sandbox_context.get("tenant_id") or "default_tenant"),
+            user_id=str(sandbox_context.get("user_id") or "local_user"),
+            shop_id=str(sandbox_context.get("shop_id") or "default_shop"),
+            profile=profile,
+            agent_id=str(sandbox_context.get("agent_id") or actor),
+            tool_name=spec.name,
+            runtime=spec.sandbox_runtime or "python",
+            code=_read_file_sandbox_code(safe_relative, instruction),
+            input_files=[input_file],
+            timeout_seconds=timeout_seconds,
+            resource_limits=SandboxResourceLimits(timeout_seconds=timeout_seconds),
+            metadata={"filename": safe_relative, "instruction_preview": instruction[:200]},
+        )
+        result = SandboxClient().execute(task)
+        if not result.ok:
+            return _tool_sandbox_error(spec.name, result.denied_reason or result.stderr or "sandbox execution failed", result.model_dump(mode="json"))
+        return sanitize_prompt_text(redact_secrets(result.stdout))
+    except SandboxUnavailableError as error:
+        return _tool_sandbox_error(spec.name, f"sandbox server unavailable: {error}")
+    except Exception as error:
+        return _tool_sandbox_error(spec.name, str(error)[:500])
+
+
+def _read_file_sandbox_code(relative_path: str, instruction: str) -> str:
+    safe_path = relative_path.replace("\\", "/")
+    safe_instruction = instruction[:500]
+    return f'''
+from pathlib import Path
+
+path = Path("/workspace/input") / {json.dumps(safe_path)}
+instruction = {json.dumps(safe_instruction)}
+suffix = path.suffix.lower()
+
+def emit(text):
+    print(str(text)[:120000])
+
+if suffix in {{".txt", ".md", ".csv", ".json", ".log"}}:
+    emit(path.read_text(encoding="utf-8", errors="replace"))
+elif suffix in {{".xlsx", ".xls"}}:
+    import pandas as pd
+    df = pd.read_excel(path)
+    parts = [
+        f"文件: {{path.name}}",
+        f"行数: {{len(df)}}, 列数: {{len(df.columns)}}",
+        "列名: " + ", ".join([str(item) for item in df.columns]),
+        "[前5行数据预览]",
+        df.head().to_string(index=False),
+        "[统计描述]",
+        df.describe(include="all").to_string(),
+    ]
+    emit("\n".join(parts))
+else:
+    try:
+        emit(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        data = path.read_bytes()
+        emit(f"二进制文件 {{path.name}}，大小 {{len(data)}} bytes，当前沙箱不解析该格式。")
+'''
+
+
+def _tool_sandbox_error(tool_name: str, reason: str, detail: Any | None = None) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "error_type": "ToolSandboxError",
+        "tool_name": tool_name,
+        "error": reason,
+        "sandbox": detail or {"ok": False, "denied_reason": reason},
+    }
+
 # 主 Agent 的产物工具：只处理文件/文档，不直接碰业务库或外部网络。
 tool_registry.register(ToolSpec(
     name="generate_markdown",
@@ -172,6 +331,8 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.markdown_tools", "generate_markdown"),
     risk="low",
     permissions=["file:write_output"],
+    allowed_profiles=["standard", "deep"],
+    needs_filesystem=True,
     description="生成 Markdown 结果文件。",
 ))
 tool_registry.register(ToolSpec(
@@ -180,6 +341,8 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.pdf_tools", "convert_md_to_pdf"),
     risk="low",
     permissions=["file:read_output", "file:write_output"],
+    allowed_profiles=["standard", "deep"],
+    needs_filesystem=True,
     description="将 Markdown 结果转换为 PDF。",
 ))
 tool_registry.register(ToolSpec(
@@ -188,6 +351,11 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.upload_file_read_tool", "read_file_content"),
     risk="medium",
     permissions=["file:read_uploaded"],
+    execution_mode="sandbox",
+    sandbox_runtime="python",
+    sandbox_required=True,
+    allowed_profiles=["standard", "deep"],
+    needs_filesystem=True,
     description="读取用户上传文件内容。",
 ))
 
@@ -199,6 +367,8 @@ tool_registry.register(ToolSpec(
     risk="high",
     permissions=["db:read", "db:write_candidate"],
     requires_human_approval=True,
+    allowed_profiles=["standard", "deep"],
+    needs_database=True,
     description="执行数据库经营分析工作流，写操作必须走候选/审核链路。",
 ))
 
@@ -209,6 +379,8 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.ragflow_tools", "get_assistant_list"),
     risk="low",
     permissions=["kb:read"],
+    allowed_profiles=["standard", "deep"],
+    needs_memory=True,
     description="查询 RAGFlow 知识库助手列表。",
 ))
 tool_registry.register(ToolSpec(
@@ -217,6 +389,8 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.ragflow_tools", "create_ask_delete"),
     risk="medium",
     permissions=["kb:ask"],
+    allowed_profiles=["standard", "deep"],
+    needs_memory=True,
     description="向 RAGFlow 助手提问并清理临时会话。",
 ))
 
@@ -227,8 +401,43 @@ tool_registry.register(ToolSpec(
     tool_factory=_lazy_tool("agent.tools.tavily_tool", "internet_search"),
     risk="medium",
     permissions=["network:search"],
+    allowed_profiles=["deep"],
+    needs_network=True,
     description="执行外部网络搜索。",
 ))
+
+
+def _register_metadata_only_tools() -> None:
+    business_tools = {
+        "query_hot_products", "query_low_conversion_products", "query_inventory_velocity", "query_campaign_roi",
+        "query_shop_profile", "query_inventory_risks", "query_sales_trend", "query_campaign_traffic",
+        "query_campaign_risks", "query_daily_metrics", "query_daily_risks", "check_import_jobs",
+        "check_data_freshness", "check_platform_authorization", "check_schema_health", "schema_lookup", "safe_read_sql",
+        "search_memory", "search_reports", "search_strategy_candidates", "sandbox_python", "sandbox_node", "sandbox_file", "sandbox_shell",
+    }
+    for name in sorted(business_tools):
+        if name in tool_registry._specs:
+            continue
+        sandbox_builtin = name.startswith("sandbox_")
+        category = "sandbox" if sandbox_builtin else ("database" if name in {"schema_lookup", "safe_read_sql"} else ("knowledge_base" if name.startswith("search_") else "business"))
+        runtime = name.removeprefix("sandbox_") if sandbox_builtin else None
+        tool_registry.register(ToolSpec(
+            name=name,
+            category=category,
+            tool_factory=_metadata_only_tool(name),
+            risk="high" if category in {"database", "sandbox"} and name == "sandbox_shell" else ("high" if category == "database" else "low"),
+            permissions=["db:read"] if category == "database" else [],
+            execution_mode="sandbox" if sandbox_builtin else "native",
+            sandbox_runtime=runtime if sandbox_builtin else None,
+            sandbox_required=sandbox_builtin,
+            allowed_profiles=["deep"] if name == "sandbox_shell" else ["standard", "deep"],
+            needs_database=category in {"database", "business"},
+            needs_memory=category == "knowledge_base",
+            description=f"deepagents-native {category} tool metadata.",
+        ))
+
+
+_register_metadata_only_tools()
 
 
 # subagent/profile 只引用这些名字，而不是直接 import 工具对象。

@@ -38,6 +38,7 @@ _session_dir_ctx: ContextVar[Optional[str]] = ContextVar("session_dir", default=
 # - 场景 ：当 Agent 打印日志或者通过 WebSocket 给前端发消息时，它需要知道：“我现在是正在服务张三，还是李四？” 这样消息才不会发错人。
 _thread_id_ctx: ContextVar[Optional[str]] = ContextVar("thread_id", default=None)
 _identity_ctx: ContextVar[Optional[MemoryIdentity]] = ContextVar("memory_identity", default=None)
+_sandbox_context_ctx: ContextVar[dict] = ContextVar("sandbox_context", default={})
 
 def set_session_context(path: str):
     """
@@ -93,6 +94,21 @@ def reset_identity_context(identity_token):
 def get_identity_context() -> Optional[MemoryIdentity]:
     """获取当前请求链路的身份上下文。"""
     return _identity_ctx.get()
+
+
+def set_sandbox_context(context: dict):
+    """设置当前请求链路的沙箱执行上下文。"""
+    return _sandbox_context_ctx.set(dict(context or {}))
+
+
+def get_sandbox_context() -> dict:
+    """获取当前请求链路的沙箱执行上下文。"""
+    return dict(_sandbox_context_ctx.get() or {})
+
+
+def reset_sandbox_context(token):
+    """恢复沙箱执行上下文。"""
+    _sandbox_context_ctx.reset(token)
 
 
 def reset_session_context(session_token, thread_token=None, identity_token=None):

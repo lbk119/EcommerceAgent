@@ -128,7 +128,7 @@ class AgentRuntime:
         tracer.emit("task_classified", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="planner_agent", latency_ms=planner_latency_ms, metadata={"stage": "task_planning", "status": "completed", **task_plan.to_trace_metadata(include_plan=False), "planned_from": "planner_acceptance_fallback"})
 
         stage_started = time.perf_counter()
-        context = build_task_context(guard_result.sanitized_query, conversation_id, task_id, tenant_id, user_id, shop_id)
+        context = build_task_context(guard_result.sanitized_query, conversation_id, task_id, tenant_id, user_id, shop_id, runtime_profile=runtime_profile)
         tracer.emit("context_prepared", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="main_agent", latency_ms=round((time.perf_counter() - stage_started) * 1000, 2), metadata={"stage": "context_prepared", "status": "completed", "tenant_id": tenant_id, "shop_id": shop_id})
 
         append_task_event("task_started", task_id, {

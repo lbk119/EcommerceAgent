@@ -151,6 +151,10 @@ class DeepAgentsNativeRuntime:
             "task_id": context.task_id,
             "conversation_id": context.conversation_id,
             "profile": profile,
+            "agent_id": "deepagents_main_agent",
+            "sandbox_timeout_seconds": get_deepagents_profile(profile).sandbox_timeout_seconds,
+            "sandbox_memory_mb": get_deepagents_profile(profile).sandbox_memory_mb,
+            "sandbox_cpu_count": get_deepagents_profile(profile).sandbox_cpu_count,
             "guard": guard,
         })
         guard_token = set_active_runtime_guard(guard)

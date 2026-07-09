@@ -12,6 +12,10 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
+from agent.sandbox.client import SandboxClient
+from agent.sandbox.errors import SandboxUnavailableError
+from agent.sandbox.models import SandboxResourceLimits, SandboxTask
+from agent.tools.registry import tool_registry
 from agent.tools.toolbox.business_tools import list_business_tools
 from agent.tools.toolbox.knowledge_tools import search_memory, search_reports, search_strategy_candidates
 from agent.tools.tool_schemas import TOOL_SCHEMAS
@@ -76,6 +80,13 @@ def _build_tool(tool_name: str, profile: str, *, owner: str = "") -> StructuredT
 
 def _call_native_tool(tool_name: str, params: dict[str, Any], profile: str, *, owner: str = "") -> Any:
     context = {**_TOOL_CONTEXT.get(), "profile": profile, "active_subagent": owner or _TOOL_CONTEXT.get().get("active_subagent")}
+    spec = tool_registry._specs.get(tool_name)
+    if profile == "realtime":
+        return _tool_error(tool_name, "realtime profile cannot execute tools")
+    if spec is None:
+        return _tool_error(tool_name, "unknown tool metadata; default deny")
+    if profile not in spec.allowed_profiles:
+        return _tool_error(tool_name, f"tool is not allowed in {profile} profile")
     guard = context.get("guard")
     if guard is not None and hasattr(guard, "record_tool_call"):
         guard.record_tool_call(tool_name, params)
@@ -87,6 +98,8 @@ def _call_native_tool(tool_name: str, params: dict[str, Any], profile: str, *, o
         agent_name=str(context.get("active_subagent") or "deepagents_tool"),
         metadata={"tool_name": tool_name, "params_hash": _hashable(params), "profile": profile},
     )
+    if spec.sandbox_required or spec.execution_mode == "sandbox":
+        return _call_sandbox_tool(tool_name, params, profile, context, spec)
     if tool_name in list_business_tools():
         return list_business_tools()[tool_name].run(params, context)
     if tool_name == "search_memory":
@@ -104,6 +117,46 @@ def _call_native_tool(tool_name: str, params: dict[str, Any], profile: str, *, o
     if tool_name == "safe_read_sql":
         return {"status": "failed", "rows": [], "error": "safe_read_sql requires approved readonly query compiler"}
     raise ValueError(f"unknown native deepagents tool: {tool_name}")
+
+
+def _call_sandbox_tool(tool_name: str, params: dict[str, Any], profile: str, context: dict[str, Any], spec: Any) -> Any:
+    try:
+        timeout_seconds = int(context.get("sandbox_timeout_seconds") or 30)
+        runtime = spec.sandbox_runtime or "python"
+        command = params.get("command") if isinstance(params.get("command"), list) else []
+        code = str(params.get("code") or "") or _default_sandbox_code(tool_name, params)
+        task = SandboxTask(
+            task_id=str(context.get("task_id") or SandboxTask.new_id()),
+            conversation_id=str(context.get("conversation_id") or context.get("task_id") or "sandbox"),
+            tenant_id=str(context.get("tenant_id") or "default_tenant"),
+            user_id=str(context.get("user_id") or "local_user"),
+            shop_id=str(context.get("shop_id") or "default_shop"),
+            profile=profile,
+            agent_id=str(context.get("active_subagent") or "deepagents_tool"),
+            tool_name=tool_name,
+            runtime=runtime,
+            command=command,
+            code=code,
+            timeout_seconds=timeout_seconds,
+            resource_limits=SandboxResourceLimits(timeout_seconds=timeout_seconds),
+            metadata={"params_hash": _hashable(params)},
+        )
+        result = SandboxClient().execute(task)
+        if not result.ok:
+            return _tool_error(tool_name, result.denied_reason or result.stderr or "sandbox execution failed", sandbox=result.model_dump(mode="json"))
+        return {"status": "ok", "stdout": result.stdout, "stderr": result.stderr, "output_files": [item.model_dump(mode="json") for item in result.output_files], "sandbox_id": result.sandbox_id, "duration_ms": result.duration_ms}
+    except SandboxUnavailableError as error:
+        return _tool_error(tool_name, f"sandbox server unavailable: {error}")
+    except Exception as error:
+        return _tool_error(tool_name, str(error)[:500])
+
+
+def _default_sandbox_code(tool_name: str, params: dict[str, Any]) -> str:
+    return "print('sandbox tool executed: ' + " + json.dumps(tool_name) + ")"
+
+
+def _tool_error(tool_name: str, reason: str, *, sandbox: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"status": "failed", "error_type": "ToolSandboxError", "tool_name": tool_name, "error": reason, "sandbox": sandbox or {"ok": False, "denied_reason": reason}}
 
 
 def _compact_params(params: dict[str, Any]) -> dict[str, Any]:
