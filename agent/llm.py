@@ -1,7 +1,7 @@
 """LLM 获取门面。
 
 业务代码不要直接读取模型环境变量或初始化 LangChain 模型，而是通过这里按语义档位获取模型。
-fast、standard、deep、critic 的供应商、超时、重试和 trace 回调都集中在 `LLMRouter` 中治理。
+fast、standard、deep、evaluation 的供应商、超时、重试和 trace 回调都集中在 `LLMRouter` 中治理。
 """
 
 from agent.platform.llm_router import llm_router
@@ -22,9 +22,9 @@ def get_deep_model():
     return llm_router.model("deep")
 
 
-def get_critic_model():
-    """返回 Critic、监督和低温质量判断使用的模型。"""
-    return llm_router.model("critic")
+def get_evaluation_model():
+    """返回 Evaluation、监督和低温质量判断使用的模型。"""
+    return llm_router.model("evaluation")
 
 
-__all__ = ["get_fast_model", "get_standard_model", "get_deep_model", "get_critic_model"]
+__all__ = ["get_fast_model", "get_standard_model", "get_deep_model", "get_evaluation_model"]

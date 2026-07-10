@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.evaluation.critic_agent import CriticIssue, CriticResult
+from agent.evaluation.evaluation_agent import EvaluationIssue, EvaluationResult
 from agent.memory import MemoryIdentity
 from agent.runtime import result_pipeline
 from agent.runtime.task_context import TaskRunContext
@@ -28,24 +28,24 @@ def context() -> TaskRunContext:
 
 
 @pytest.mark.asyncio
-async def test_critic_failure_appends_quality_note_without_blocking_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_run_critic(*args, **kwargs):
-        return CriticResult(
+async def test_evaluation_failure_appends_quality_note_without_blocking_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_run_evaluation(*args, **kwargs):
+        return EvaluationResult(
             passed=False,
-            issues=[CriticIssue(type="missing_evidence", message="no source metrics")],
+            issues=[EvaluationIssue(type="missing_evidence", message="no source metrics")],
             fix_instruction="add metric evidence",
         )
 
-    monkeypatch.setenv("CRITIC_ENABLED", "true")
-    monkeypatch.setattr(result_pipeline, "evaluate_critic_policy", lambda *args, **kwargs: type("Decision", (), {"required": True, "to_metadata": lambda self: {"required": True}})())
-    monkeypatch.setattr(result_pipeline, "run_critic", fake_run_critic)
+    monkeypatch.setenv("EVALUATION_ENABLED", "true")
+    monkeypatch.setattr(result_pipeline, "evaluate_evaluation_policy", lambda *args, **kwargs: type("Decision", (), {"required": True, "to_metadata": lambda self: {"required": True}})())
+    monkeypatch.setattr(result_pipeline, "run_evaluation", fake_run_evaluation)
     monkeypatch.setattr(result_pipeline, "get_tool_calls_for_task", lambda task_id: [])
     monkeypatch.setattr(result_pipeline.monitor, "report_task_result", lambda result: None)
     monkeypatch.setattr(result_pipeline.tracer, "emit", lambda *args, **kwargs: None)
 
-    result = await result_pipeline.run_critic_stage(context(), "base result", agent_specs=[], rerun_with_fix=None)
+    result = await result_pipeline.run_evaluation_stage(context(), "base result", agent_specs=[], rerun_with_fix=None)
 
-    assert result.critic_status == "failed"
+    assert result.evaluation_status == "failed"
     assert result.content.startswith("base result")
     assert "missing_evidence" in result.content
 

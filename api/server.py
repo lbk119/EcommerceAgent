@@ -518,7 +518,7 @@ async def get_agent_runtime_slow_tasks(limit: int = 20):
 
 @app.get("/api/agent-runtime/tasks/{task_id}/diagnosis")
 async def get_agent_runtime_task_diagnosis(task_id: str):
-    """返回单个任务的慢因诊断：模型/工具/subagent/critic/memory/预算等维度?"""
+    """返回单个任务的慢因诊断：模型/工具/subagent/evaluation/memory/预算等维度。"""
     return diagnose_task(task_id)
 
 

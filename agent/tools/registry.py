@@ -6,7 +6,7 @@
 
 1. Agent 只通过稳定的工具名引用工具，避免到处直接 import 具体工具函数。
 2. 每个工具都有风险等级、权限要求和审批要求，后续权限治理可以直接复用。
-3. 前端、Critic、审计日志可以读取同一份工具目录，不需要重复维护一份说明。
+3. 前端、Evaluation、审计日志可以读取同一份工具目录，不需要重复维护一份说明。
 
 注意：ToolSpec.name 应当和 LangChain tool 的名称保持一致，便于追踪和权限拦截。
 """
@@ -26,9 +26,9 @@ class ToolSpec:
 
     字段说明：
     - name: 工具稳定标识。subagent spec、权限策略、审计事件都用这个名字引用工具。
-    - tool_factory: 懒加载实际 LangChain tool 对象的工厂。catalog、权限和 Critic policy 只读元数据，
+    - tool_factory: 懒加载实际 LangChain tool 对象的工厂。catalog、权限和 Evaluation policy 只读元数据，
             不应该因为导入 ToolRegistry 就初始化 LLM、RAGFlow 或数据库 workflow。
-    - category: 工具类别，用于前端分组、审计筛选和 Critic 校验策略选择。
+    - category: 工具类别，用于前端分组、审计筛选和 Evaluation 校验策略选择。
     - risk: 风险等级。建议使用 low / medium / high，后续权限引擎可按等级加严。
     - permissions: 调用工具所需的权限点，例如 db:read、file:write_output。
     - requires_human_approval: 是否天然需要人工审核。这里是工具元数据，不代表所有调用都会立刻阻塞。
@@ -76,7 +76,7 @@ class ToolRegistry:
         """
         按稳定工具名获取实际 tool 对象，供 DeepAgents 挂载。
 
-        这是唯一会触发工具模块 import 的入口。这样 `/api/tools/catalog`、Critic policy、任务分类和
+        这是唯一会触发工具模块 import 的入口。这样 `/api/tools/catalog`、Evaluation policy、任务分类和
         轻量测试导入 ToolRegistry 时，只会加载元数据，不会初始化 LLM 或外部客户端。
         """
         if name not in self._tools:
@@ -84,7 +84,7 @@ class ToolRegistry:
         return self._tools[name]
 
     def get_spec(self, name: str) -> ToolSpec:
-        """按稳定工具名获取工具元数据，供权限、审计、Critic 使用。"""
+        """按稳定工具名获取工具元数据，供权限、审计、Evaluation 使用。"""
         return self._specs[name]
 
     def tools(self, names: List[str], granted_permissions: Optional[List[str]] = None, actor: str = "unknown_agent") -> List[Any]:
@@ -394,7 +394,7 @@ tool_registry.register(ToolSpec(
     description="向 RAGFlow 助手提问并清理临时会话。",
 ))
 
-# 网络搜索会访问外部互联网，结果需要由 Agent/Critic 判断可信度，不能直接当作业务事实。
+# 网络搜索会访问外部互联网，结果需要由 Agent/Evaluation 判断可信度，不能直接当作业务事实。
 tool_registry.register(ToolSpec(
     name="internet_search",
     category="network",

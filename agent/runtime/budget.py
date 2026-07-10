@@ -36,7 +36,7 @@ class AgentExecutionBudget:
     max_tool_calls: int
     max_subagent_calls: int
     max_reflection_retries: int
-    max_critic_revisions: int
+    max_evaluation_revisions: int
     allow_network_search: bool
     allow_memory_write: bool
     allow_policy_evolution: bool
@@ -60,7 +60,7 @@ class AgentExecutionBudget:
             "max_tool_calls": self.max_tool_calls,
             "max_subagent_calls": self.max_subagent_calls,
             "max_reflection_retries": self.max_reflection_retries,
-            "max_critic_revisions": self.max_critic_revisions,
+            "max_evaluation_revisions": self.max_evaluation_revisions,
             "allow_network_search": self.allow_network_search,
             "allow_memory_write": self.allow_memory_write,
             "allow_policy_evolution": self.allow_policy_evolution,

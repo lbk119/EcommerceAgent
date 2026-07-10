@@ -1,7 +1,7 @@
 """任务结果后处理流水线。
 
 Agent 得到 final_result 之后，还需要完成一组“质量和记忆闭环”：
-- 按需运行 Critic；
+- 按需运行 Evaluation；
 - 生成任务反思；
 - 创建策略建议；
 - 写入长期记忆候选；
@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Optional, Sequence
 
 from api.monitor import monitor
-from agent.evaluation.critic_agent import CriticResult, run_critic
-from agent.evaluation.critic_policy import evaluate_critic_policy
+from agent.evaluation.evaluation_agent import EvaluationResult, run_evaluation
+from agent.evaluation.evaluation_policy import evaluate_evaluation_policy
 from agent.reflection.policy_review import create_policy_proposal
 from agent.reflection.reflection import build_task_reflection
 from agent.reflection.evolution_log import append_reflection, append_task_event
@@ -28,40 +28,40 @@ from agent.runtime.task_context import TaskRunContext
 from agent.security.redaction import redact_secrets
 
 
-CriticRevisionRunner = Callable[[str], Awaitable[str]]
-CriticStatus = Literal["skipped", "passed", "failed"]
+EvaluationRevisionRunner = Callable[[str], Awaitable[str]]
+EvaluationStatus = Literal["skipped", "passed", "failed"]
 
 
 @dataclass(frozen=True)
-class CriticStageResult:
-    """Critic 阶段输出，包含最终文本和质量校验状态。"""
+class EvaluationStageResult:
+    """Evaluation 阶段输出，包含最终文本和质量校验状态。"""
 
     content: str
-    critic_status: CriticStatus
+    evaluation_status: EvaluationStatus
 
 
-async def run_critic_stage(
+async def run_evaluation_stage(
     context: TaskRunContext,
     final_result: str,
     *,
     agent_specs: Optional[Sequence[Any]] = None,
-    rerun_with_fix: Optional[CriticRevisionRunner] = None,
+    rerun_with_fix: Optional[EvaluationRevisionRunner] = None,
     task_plan: Optional[AgentTaskPlan] = None,
-) -> CriticStageResult:
+) -> EvaluationStageResult:
     """
     质量校验阶段。
 
-    AgentRuntime 会直接调用这个阶段。这里统一承接 Critic retry、未来多 Critic 或不同任务类型的校验器，
+    AgentRuntime 会直接调用这个阶段。这里统一承接 Evaluation retry、未来多维质量校验器，
     都可以在一个边界内替换，而不会影响结果持久化和记忆写入。
     """
-    content, critic_status = await _apply_critic_if_needed(
+    content, evaluation_status = await _apply_evaluation_if_needed(
         context,
         final_result,
         agent_specs=agent_specs or [],
         rerun_with_fix=rerun_with_fix,
         task_plan=task_plan,
     )
-    return CriticStageResult(content=content, critic_status=critic_status)
+    return EvaluationStageResult(content=content, evaluation_status=evaluation_status)
 
 
 def persist_result(context: TaskRunContext, final_result: str, *, runtime_profile: str = "deep") -> dict:
@@ -144,110 +144,110 @@ def process_failure(context: TaskRunContext, error_message: str, reason: str = "
     tracer.emit("agent_finished", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="main_agent", error=error_message, metadata={"status": "failed", "reason": reason})
 
 
-async def _apply_critic_if_needed(
+async def _apply_evaluation_if_needed(
     context: TaskRunContext,
     final_result: str,
     *,
     agent_specs: Sequence[Any],
-    rerun_with_fix: Optional[CriticRevisionRunner],
+    rerun_with_fix: Optional[EvaluationRevisionRunner],
     task_plan: Optional[AgentTaskPlan],
-) -> tuple[str, CriticStatus]:
+) -> tuple[str, EvaluationStatus]:
     """
-    对高价值任务执行 Critic。
+    对高价值任务执行 Evaluation。
 
-    策略由 agent.evaluation.critic_policy 统一判断；Critic 未通过时最多触发一次受控修正重跑，避免形成
-    Critic -> Agent -> Critic 的无限循环。
+    策略由 agent.evaluation.evaluation_policy 统一判断；Evaluation 未通过时最多触发一次受控修正重跑，避免形成
+    Evaluation -> Agent -> Evaluation 的无限循环。
     """
-    if not _critic_enabled() or not final_result:
-        # 没有内容时跳过 Critic，否则 Critic 只能检查空文本，反而制造噪声。
-        tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "disabled_or_empty"})
+    if not _evaluation_enabled() or not final_result:
+        # 没有内容时跳过 Evaluation，否则只能检查空文本，反而制造噪声。
+        tracer.emit("evaluation_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="evaluation_agent", metadata={"stage": "evaluation", "status": "skipped", "reason": "disabled_or_empty"})
         return final_result, "skipped"
 
-    policy_decision = evaluate_critic_policy(
+    policy_decision = evaluate_evaluation_policy(
         context.query,
         agent_specs=agent_specs,
         tool_calls=get_tool_calls_for_task(context.task_id),
         task_plan=task_plan,
     )
     tracer.emit(
-        "critic_policy_evaluated",
+        "evaluation_policy_evaluated",
         trace_id=context.task_id,
         task_id=context.task_id,
         conversation_id=context.conversation_id,
-        agent_name="critic_agent",
+        agent_name="evaluation_agent",
         metadata=policy_decision.to_metadata(),
     )
     if not policy_decision.required:
-        tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "policy_not_required"})
+        tracer.emit("evaluation_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="evaluation_agent", metadata={"stage": "evaluation", "status": "skipped", "reason": "policy_not_required"})
         return final_result, "skipped"
 
-    critic_result = await run_critic(context.query, final_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)
-    if critic_result.passed:
+    evaluation_result = await run_evaluation(context.query, final_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)
+    if evaluation_result.passed:
         return final_result, "passed"
 
-    max_revisions = int(os.getenv("CRITIC_MAX_REVISIONS", "1"))
+    max_revisions = int(os.getenv("EVALUATION_MAX_REVISIONS", "1"))
     if rerun_with_fix and max_revisions > 0:
-        # 只允许一次受控修正，防止 Critic 与 Agent 形成互相重跑的循环。
-        revised_result = await _run_single_critic_revision(context, final_result, critic_result, rerun_with_fix)
+        # 只允许一次受控修正，防止 Evaluation 与 Agent 形成互相重跑的循环。
+        revised_result = await _run_single_evaluation_revision(context, final_result, evaluation_result, rerun_with_fix)
         if revised_result:
-            revised_critic_result = await run_critic(context.query, revised_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)
-            if revised_critic_result.passed:
+            revised_evaluation_result = await run_evaluation(context.query, revised_result, trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id)
+            if revised_evaluation_result.passed:
                 return revised_result, "passed"
-            return _append_critic_issues(revised_result, revised_critic_result), "failed"
+            return _append_evaluation_issues(revised_result, revised_evaluation_result), "failed"
 
-    return _append_critic_issues(final_result, critic_result), "failed"
+    return _append_evaluation_issues(final_result, evaluation_result), "failed"
 
 
-async def _run_single_critic_revision(
+async def _run_single_evaluation_revision(
     context: TaskRunContext,
     final_result: str,
-    critic_result: CriticResult,
-    rerun_with_fix: CriticRevisionRunner,
+    evaluation_result: EvaluationResult,
+    rerun_with_fix: EvaluationRevisionRunner,
 ) -> str:
-    """按 Critic 给出的修复指令重跑一次主 Agent，失败时回退到原始结果。"""
-    fix_prompt = _build_critic_fix_prompt(context.query, final_result, critic_result)
+    """按 Evaluation 给出的修复指令重跑一次主 Agent，失败时回退到原始结果。"""
+    fix_prompt = _build_evaluation_fix_prompt(context.query, final_result, evaluation_result)
     tracer.emit(
-        "critic_revision_started",
+        "evaluation_revision_started",
         trace_id=context.task_id,
         task_id=context.task_id,
         conversation_id=context.conversation_id,
-        agent_name="critic_agent",
-        metadata={"max_revisions": int(os.getenv("CRITIC_MAX_REVISIONS", "1"))},
+        agent_name="evaluation_agent",
+        metadata={"max_revisions": int(os.getenv("EVALUATION_MAX_REVISIONS", "1"))},
     )
     try:
         revised_result = await rerun_with_fix(fix_prompt)
         tracer.emit(
-            "critic_revision_finished",
+            "evaluation_revision_finished",
             trace_id=context.task_id,
             task_id=context.task_id,
             conversation_id=context.conversation_id,
-            agent_name="critic_agent",
+            agent_name="evaluation_agent",
             metadata={"revised": bool(revised_result)},
         )
         return revised_result
     except Exception as error:
         tracer.emit(
-            "critic_revision_failed",
+            "evaluation_revision_failed",
             trace_id=context.task_id,
             task_id=context.task_id,
             conversation_id=context.conversation_id,
-            agent_name="critic_agent",
+            agent_name="evaluation_agent",
             error=str(error)[:1000],
         )
         return final_result
 
 
-def _build_critic_fix_prompt(task_query: str, final_result: str, critic_result: CriticResult) -> str:
-    """把 Critic 发现的问题转换成一次性修复提示。"""
-    issue_lines = [f"- {issue.type}: {issue.message}" for issue in critic_result.issues]
-    fix_instruction = critic_result.fix_instruction or "请补充缺失的数据来源、指标或结论依据。"
+def _build_evaluation_fix_prompt(task_query: str, final_result: str, evaluation_result: EvaluationResult) -> str:
+    """把 Evaluation 发现的问题转换成一次性修复提示。"""
+    issue_lines = [f"- {issue.type}: {issue.message}" for issue in evaluation_result.issues]
+    fix_instruction = evaluation_result.fix_instruction or "请补充缺失的数据来源、指标或结论依据。"
     return f"""
 用户原始任务：
 {task_query}
 
-你上一次输出未通过 Critic 质量校验。请基于已有上下文和必要工具调用，最多做一次补充修正，输出完整的最终答案。
+你上一次输出未通过 Evaluation 质量校验。请基于已有上下文和必要工具调用，最多做一次补充修正，输出完整的最终答案。
 
-Critic 发现的问题：
+Evaluation 发现的问题：
 {chr(10).join(issue_lines)}
 
 修复指令：
@@ -258,23 +258,23 @@ Critic 发现的问题：
 """
 
 
-def _append_critic_issues(final_result: str, critic_result: CriticResult) -> str:
+def _append_evaluation_issues(final_result: str, evaluation_result: EvaluationResult) -> str:
     """修正不可用或修正后仍未通过时，把质量缺口显式追加到最终答案。"""
-    issue_lines = [f"- {issue.type}: {issue.message}" for issue in critic_result.issues]
+    issue_lines = [f"- {issue.type}: {issue.message}" for issue in evaluation_result.issues]
     final_result = (
         f"{final_result}\n\n"
         "【质量校验提示】\n"
-        "Critic 检测到当前结果仍有待补充：\n"
+        "Evaluation 检测到当前结果仍有待补充：\n"
         f"{chr(10).join(issue_lines)}\n"
-        f"建议修复：{critic_result.fix_instruction or '请补充缺失的数据来源、指标或结论依据。'}"
+        f"建议修复：{evaluation_result.fix_instruction or '请补充缺失的数据来源、指标或结论依据。'}"
     )
     monitor.report_task_result(final_result)
     return final_result
 
 
-def _critic_enabled() -> bool:
-    """Critic 默认启用；本地调试或压测时可通过 CRITIC_ENABLED=false 暂时关闭。"""
-    return os.getenv("CRITIC_ENABLED", "true").lower() == "true"
+def _evaluation_enabled() -> bool:
+    """Evaluation 默认启用；本地调试或压测时可通过 EVALUATION_ENABLED=false 暂时关闭。"""
+    return os.getenv("EVALUATION_ENABLED", "true").lower() == "true"
 
 
 def get_tool_calls_for_task(task_id: str) -> list[dict[str, Any]]:

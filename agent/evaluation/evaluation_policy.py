@@ -1,6 +1,6 @@
-"""Critic 触发策略。
+"""Evaluation 触发策略。
 
-Critic 是否运行不应该散落在关键词判断里。这里把平台治理字段、任务类型、工具风险和用户请求
+Evaluation 是否运行不应该散落在关键词判断里。这里把平台治理字段、任务类型、工具风险和用户请求
 统一收敛成一个可观测的决策对象，方便前端展示、审计和策略调优。
 
 注意：本文件只决定“是否需要复核”，不负责业务分类，也不直接调用模型。
@@ -14,7 +14,7 @@ from agent.plan.models import AgentTaskPlan
 from agent.plan.planner import planner_agent
 
 
-CRITIC_KEYWORDS = (
+EVALUATION_KEYWORDS = (
     "经营日报",
     "日报",
     "sql",
@@ -27,7 +27,7 @@ CRITIC_KEYWORDS = (
     "异常分析",
 )
 
-# 关键词到治理任务类型的映射。这里用于解释“为什么需要 Critic”，不是最终业务分类器。
+# 关键词到治理任务类型的映射。这里用于解释“为什么需要质量复核”，不是最终业务分类器。
 TASK_TYPE_KEYWORDS = {
     "business_report": ("经营日报", "日报", "周报", "月报", "经营分析"),
     "database_change": ("sql", "写入", "更新", "插入", "删除", "改库", "入库"),
@@ -38,8 +38,8 @@ TASK_TYPE_KEYWORDS = {
 
 
 @dataclass(frozen=True)
-class CriticPolicyDecision:
-    """Critic 策略的结构化决策结果。"""
+class EvaluationPolicyDecision:
+    """Evaluation 策略的结构化决策结果。"""
 
     required: bool
     reasons: List[str] = field(default_factory=list)
@@ -60,34 +60,34 @@ class CriticPolicyDecision:
         }
 
 
-def evaluate_critic_policy(
+def evaluate_evaluation_policy(
     query: str,
     *,
     agent_specs: Optional[Iterable[Any]] = None,
     tool_calls: Optional[Iterable[Dict[str, Any]]] = None,
     task_plan: Optional[AgentTaskPlan] = None,
-) -> CriticPolicyDecision:
-    """判断当前任务是否需要 Critic 复核。"""
+) -> EvaluationPolicyDecision:
+    """判断当前任务是否需要质量复核。"""
     task_plan = task_plan or planner_agent.plan(query)
     compact_query = query.lower().replace(" ", "")
     reasons: List[str] = []
-    matched_keywords = [keyword for keyword in CRITIC_KEYWORDS if keyword.lower() in compact_query]
+    matched_keywords = [keyword for keyword in EVALUATION_KEYWORDS if keyword.lower() in compact_query]
     task_types = _match_task_types(compact_query, task_plan)
-    agent_names = _match_critic_required_agents(agent_specs or [], tool_calls or [])
+    agent_names = _match_evaluation_required_agents(agent_specs or [], tool_calls or [])
     high_risk_tools = _match_high_risk_tools(tool_calls or [])
 
     if matched_keywords:
         reasons.append("user_request_keyword")
     if task_types:
         reasons.append("task_type")
-    if task_plan.critic_required and "task_plan" not in reasons:
+    if task_plan.evaluation_required and "task_plan" not in reasons:
         reasons.append("task_plan")
     if agent_names:
-        reasons.append("agent_spec_critic_required")
+        reasons.append("agent_spec_evaluation_required")
     if high_risk_tools:
         reasons.append("tool_risk")
 
-    return CriticPolicyDecision(
+    return EvaluationPolicyDecision(
         required=bool(reasons),
         reasons=reasons,
         task_types=task_types,
@@ -108,8 +108,8 @@ def _match_task_types(compact_query: str, task_plan: AgentTaskPlan) -> List[str]
     return sorted(set(task_types))
 
 
-def _match_critic_required_agents(agent_specs: Iterable[Any], tool_calls: Iterable[Dict[str, Any]]) -> List[str]:
-    """根据已观察到的工具或 Agent 调用，找出需要 Critic 复核的 subagent。"""
+def _match_evaluation_required_agents(agent_specs: Iterable[Any], tool_calls: Iterable[Dict[str, Any]]) -> List[str]:
+    """根据已观察到的工具或 Agent 调用，找出需要质量复核的 subagent。"""
     observed_tools = {str(call.get("tool_name", "")) for call in tool_calls}
     observed_subagents = {
         str(call.get("args", {}).get("subagent_type", ""))
@@ -120,8 +120,8 @@ def _match_critic_required_agents(agent_specs: Iterable[Any], tool_calls: Iterab
     for spec in agent_specs:
         spec_name = str(getattr(spec, "name", ""))
         spec_tools = tuple(getattr(spec, "allowed_tools", getattr(spec, "tools", ())) or ())
-        critic_required = bool(getattr(spec, "critic_required", False)) or str(getattr(spec, "risk_level", "")).lower() == "high"
-        if not critic_required:
+        evaluation_required = bool(getattr(spec, "evaluation_required", False)) or str(getattr(spec, "risk_level", "")).lower() == "high"
+        if not evaluation_required:
             continue
         if spec_name in observed_subagents or any(tool_name in observed_tools for tool_name in spec_tools):
             agent_names.append(spec_name)
@@ -143,5 +143,3 @@ def _match_high_risk_tools(tool_calls: Iterable[Dict[str, Any]]) -> List[str]:
         if tool_name and (risk == "high" or requires_human_approval):
             high_risk_tools.append(tool_name)
     return sorted(set(high_risk_tools))
-
-

@@ -25,11 +25,11 @@ def diagnose_task(task_id: str) -> dict[str, Any]:
     model_calls = sum(1 for event_type in event_types if event_type == "llm_call_started")
     tool_calls = sum(1 for event_type in event_types if event_type == "tool_call_started")
     subagent_calls = sum(1 for metadata in metadata_list if metadata.get("tool_name") == "task")
-    critic_events = [event for event in events if str(event.get("event_type") or "").startswith("critic")]
+    evaluation_events = [event for event in events if str(event.get("event_type") or "").startswith("evaluation")]
     memory_events = [event for event in events if "memory" in str(event.get("event_type") or "")]
     slowest = _slowest_events(events)
     bottleneck = slowest[0]["stage"] if slowest else "unknown"
-    recommendations = _recommendations(events, model_calls, tool_calls, subagent_calls, critic_events)
+    recommendations = _recommendations(events, model_calls, tool_calls, subagent_calls, evaluation_events)
 
     return {
         "taskId": task_id,
@@ -39,8 +39,8 @@ def diagnose_task(task_id: str) -> dict[str, Any]:
         "modelCalls": model_calls,
         "toolCalls": tool_calls,
         "subagentCalls": subagent_calls,
-        "criticEnabled": bool(critic_events and not any((event.get("metadata") or {}).get("status") == "skipped" for event in critic_events)),
-        "criticEventCount": len(critic_events),
+        "evaluationEnabled": bool(evaluation_events and not any((event.get("metadata") or {}).get("status") == "skipped" for event in evaluation_events)),
+        "evaluationEventCount": len(evaluation_events),
         "memoryEventCount": len(memory_events),
         "memoryWriteMs": _sum_latency(memory_events),
         "retryTriggered": any("retry" in event_type or "revision" in event_type for event_type in event_types),
@@ -71,7 +71,7 @@ def _slowest_events(events: list[dict[str, Any]], limit: int = 5) -> list[dict[s
     return candidates[:limit]
 
 
-def _recommendations(events: list[dict[str, Any]], model_calls: int, tool_calls: int, subagent_calls: int, critic_events: list[dict[str, Any]]) -> list[str]:
+def _recommendations(events: list[dict[str, Any]], model_calls: int, tool_calls: int, subagent_calls: int, evaluation_events: list[dict[str, Any]]) -> list[str]:
     """根据简单工程规则生成优化建议。"""
     recommendations: list[str] = []
     event_types = [str(event.get("event_type") or "") for event in events]
@@ -86,8 +86,8 @@ def _recommendations(events: list[dict[str, Any]], model_calls: int, tool_calls:
         recommendations.append(f"subagent 调用次数为 {subagent_calls}，建议只在 deep profile 允许多 subagent。")
     if any((event.get("metadata") or {}).get("tool_name") == "internet_search" for event in events):
         recommendations.append("任务调用了网络搜索；如果用户未明确要求外部信息，应在 standard/realtime 禁用。")
-    if any(event.get("event_type") == "critic_revision_started" for event in critic_events):
-        recommendations.append("Critic revision 触发了额外重跑，普通分析建议可关闭 Critic rerun。")
+    if any(event.get("event_type") == "evaluation_revision_started" for event in evaluation_events):
+        recommendations.append("Evaluation revision 触发了额外重跑，普通分析建议可关闭 Evaluation rerun。")
     if any(event.get("event_type") == "budget_exceeded" for event in events):
         recommendations.append("任务触发了执行预算，建议拆分问题或转 deep 后台任务。")
     if not recommendations:

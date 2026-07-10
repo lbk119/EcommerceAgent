@@ -42,7 +42,7 @@ def build_task_timeline(task_id: str) -> Dict[str, Any]:
             "required": metadata.get("required"),
             "time_range": metadata.get("time_range"),
             "section_errors": metadata.get("section_errors"),
-            "critic_status": metadata.get("critic_status"),
+            "evaluation_status": metadata.get("evaluation_status"),
             "latency_ms": event.get("latency_ms") or metadata.get("latency_ms"),
             "token_input": event.get("token_input"),
             "token_output": event.get("token_output"),

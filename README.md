@@ -104,7 +104,7 @@ flowchart TD
   Decide --> Subs["业务 subagents"]
   Subs --> Tools["授权工具调用"]
   Tools --> Reduce["结果汇总"]
-  Reduce --> Eval["Critic / evaluation"]
+  Reduce --> Eval["evaluation"]
   Eval --> Persist["落库、trace、报告、WebSocket"]
 ```
 
@@ -123,7 +123,7 @@ standard/deep profile 的原则：
 
 ```text
 agent/
-  evaluation/   Critic 评估与质量检查
+  evaluation/   evaluation 评估与质量检查
   memory/       DeepAgents store 长期记忆入口
   plan/         PlannerAgent 与 AgentTaskPlan 协议
   platform/     数据库和 LLM 路由等平台适配
@@ -204,7 +204,7 @@ PlannerAgent 不做的事情：
 
 | 文件 | 说明 |
 | --- | --- |
-| `agent_runtime.py` | 统一运行入口，串联 plan、execute、critic、persist、trace。 |
+| `agent_runtime.py` | 统一运行入口，串联 plan、execute、evaluation、persist、trace。 |
 | `profiles.py` | runtime profile 归一化和默认策略。 |
 | `budget.py` | wall time、模型调用、工具调用、subagent 调用等预算。 |
 | `task_context.py` | 任务上下文，包含 tenant/user/shop/conversation/task/profile。 |
@@ -219,7 +219,7 @@ Runtime 的职责：
 - 调用 PlannerAgent 生成 AgentTaskPlan。
 - 按 profile 调用 DeepAgents runtime。
 - 捕获失败、超时、取消和降级。
-- 将结果交给 Critic、Reflection、Trace 和 API 持久化层。
+- 将结果交给 evaluation、Reflection、Trace 和 API 持久化层。
 
 ### agent/tools
 
@@ -283,7 +283,7 @@ Runtime 的职责：
 
 trace 用于：
 
-- 查看每个 Agent 任务的 planner、subagent、tool、critic、result 阶段。
+- 查看每个 Agent 任务的 planner、subagent、tool、evaluation、result 阶段。
 - 汇总平均耗时、失败原因、慢任务。
 - 支撑非功能测试报告。
 - 排查 E2E 和后台任务资源竞争问题。
@@ -294,10 +294,10 @@ trace 用于：
 
 | 文件 | 说明 |
 | --- | --- |
-| `critic_agent.py` | Critic 评估逻辑。 |
-| `critic_policy.py` | Critic 策略和阈值。 |
+| `evaluation_agent.py` | evaluation 评估逻辑。 |
+| `evaluation_policy.py` | evaluation 策略和阈值。 |
 
-Critic 关注：
+evaluation 关注：
 
 - 输出是否满足用户目标。
 - 是否说明证据、风险和缺失数据。
@@ -419,6 +419,58 @@ SANDBOX_NODE_IMAGE=ecommerce-agent-sandbox-node:latest
 `/api/v1/sandbox/*` 是 Brain 内部接口，不应作为普通前端功能暴露；调用方必须携带 `X-Sandbox-Internal-Token`。生产环境必须替换默认 token，并在网关或部署层限制该接口只允许内部服务访问。
 
 详细协议和扩展方式见 [docs/docker_sandbox.md](docs/docker_sandbox.md)。
+
+## Evaluation Agent 评估体系
+
+项目现在有两层 Evaluation：
+
+1. `agent/evaluation/evaluation_agent.py`
+   单次任务质量复核入口，运行在 AgentRuntime 的结果阶段。它负责检查经营日报、库存补货、活动复盘、写库候选等高价值输出是否缺少关键指标、证据或风险说明。运行时接口是 `run_evaluation`，返回 `EvaluationResult`。
+
+2. `agent/evaluation/system_evaluator.py`
+   系统级 Evaluation Agent，不在每次用户请求热路径里执行。它读取测试 artifact、TaskPlan 协议、ToolRegistry、Runtime budget、Memory namespace、Sandbox policy、Prompt Guard、API/trace 等事实来源，生成发布验收报告。
+
+系统级评估覆盖 10 个维度：
+
+| 维度 | 说明 |
+| --- | --- |
+| Business Output Quality | 经营日报、商品分析、活动复盘等业务输出质量。 |
+| Planner Compliance | Planner 是否正确澄清、边界判断、profile 分流和任务规划。 |
+| Subagent Assignment | 业务 subagent 分派、依赖和工具白名单是否正确。 |
+| Tool Contract And Schema | 工具 metadata、schema、权限、风险等级和 sandbox 标记。 |
+| Runtime Budget And Loop Guard | 模型调用、工具调用、subagent 调用、超时和循环保护。 |
+| Memory Isolation | DeepAgents Store namespace、生产记忆后端和跨租户隔离。 |
+| Docker Sandbox Security | Docker 沙箱策略、容器硬化、workspace 和 sandbox E2E 证据。 |
+| Prompt Guard And Security | prompt injection、数据泄露、内网/metadata 地址拦截。 |
+| Evaluation And Reflection Quality | 单次 Evaluation、反思和策略候选审核链路。 |
+| API Contract And Observability | API schema、trace、health、E2E 和 release summary。 |
+
+运行系统级评估：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_evaluation_agent.py --mode dev
+```
+
+发版模式：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_evaluation_agent.py --mode release
+```
+
+如需在评分前先跑 Docker sandbox HTTP E2E：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_evaluation_agent.py --mode dev --run-sandbox-e2e
+```
+
+输出文件：
+
+```text
+output/evaluation/evaluation_report.json
+output/evaluation/evaluation_report.md
+```
+
+dev 模式允许 E2E、performance、chaos 等强验收暂时缺失，但会扣维度分和 confidence，并给出 `PASS_WITH_WARNINGS`。release 模式会把关键缺口作为阻断项，例如 sandbox E2E 未通过、performance/chaos 未运行、关键安全维度低于 release minimum 都会 `BLOCK`。
 
 ## 运行说明
 

@@ -2,8 +2,8 @@
 
 ## Test Layers
 
-1. Unit and contract tests: Python uses pytest and pytest-asyncio for Planner, deepagents-native subagent delegation, tool schema validation, runtime guard orchestration, memory, security, critic, and schema contracts. Go gateway tests use go test with focused middleware, JWT, tenant, Casbin, proxy, and health checks.
-2. End-to-end smoke tests: pytest wrappers cover register/login, onboarding, sample import, AI Chat, Planner, deepagents-native execution, critic/memory, report/job persistence, and timeline ordering. PowerShell smoke scripts remain local entry points.
+1. Unit and contract tests: Python uses pytest and pytest-asyncio for Planner, deepagents-native subagent delegation, tool schema validation, runtime guard orchestration, memory, security, evaluation, and schema contracts. Go gateway tests use go test with focused middleware, JWT, tenant, Casbin, proxy, and health checks.
+2. End-to-end smoke tests: pytest wrappers cover register/login, onboarding, sample import, AI Chat, Planner, deepagents-native execution, evaluation/memory, report/job persistence, and timeline ordering. PowerShell smoke scripts remain local entry points.
 3. Quality evaluation: mock DeepEval-style tests score planner compliance, role boundary, groundedness, actionability, and hallucination risk. Live DeepEval/Giskard judging is opt-in with `RUN_LIVE_LLM_EVALS=1`.
 4. Security automation: pytest red-team cases cover prompt injection, data leakage, cross-tenant memory leakage, and tool overreach. promptfoo, Giskard, and garak directories are placeholders for external runners.
 5. Performance and chaos: Locust models authenticated workflows and AI Chat polling. k6 covers gateway HTTP smoke. Chaos Toolkit experiment samples describe LLM timeout, Redis/NATS outage, MySQL slowness, and Brain API 5xx cases.

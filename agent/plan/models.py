@@ -168,7 +168,7 @@ class AgentTaskPlan:
         return dict(self.metadata.get("constraints") or {})
 
     @property
-    def critic_required(self) -> bool:
+    def evaluation_required(self) -> bool:
         return self.profile == "deep" or len(self.assignments) > 1 or self.risk_level in {"medium", "high"}
 
     def to_lightweight_dict(self) -> dict[str, Any]:
@@ -199,7 +199,7 @@ class AgentTaskPlan:
             "primary_goal": self.primary_task_type,
             "execution_mode": self.execution_mode,
             "risk": self.risk_level,
-            "requires_critic": self.critic_required,
+            "requires_evaluation": self.evaluation_required,
             "profile": self.profile,
             "agent_assignment_count": len(self.assignments),
         }

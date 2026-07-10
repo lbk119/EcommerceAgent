@@ -212,8 +212,8 @@ def _stage_for_event(event_type: str) -> str:
         return "tool"
     if event_type.startswith("llm_call"):
         return "llm"
-    if event_type.startswith("critic"):
-        return "critic"
+    if event_type.startswith("evaluation"):
+        return "evaluation"
     if event_type.startswith("persistence"):
         return "persistence"
     if event_type.startswith("memory_write") or event_type == "memory_written":
@@ -247,7 +247,7 @@ def _display_for_event(event_type: str, stage: str, data: Dict[str, Any]) -> Dic
         "workflow_route_decided": ("命中工作流", "已选择快速 workflow" if data.get("workflow_name") else "未命中固定 workflow"),
         "llm_call_started": ("生成建议", "正在生成建议"),
         "llm_call_finished": ("生成建议", "建议生成完成"),
-        "critic_skipped": ("质量检查", "轻量模式跳过完整 Critic"),
+        "evaluation_skipped": ("质量检查", "轻量模式跳过完整 Evaluation"),
         "persistence_finished": ("写入结果", "结果已写入"),
         "memory_write_skipped": ("写入结果", "记忆写入后台处理"),
         "agent_finished": ("完成", "分析完成"),
@@ -270,7 +270,7 @@ def _group_for_stage(stage: str) -> str:
         return "读取数据"
     if stage == "llm":
         return "生成建议"
-    if stage == "critic":
+    if stage == "evaluation":
         return "质量检查"
     if stage in {"persistence", "memory_write"}:
         return "写入结果"

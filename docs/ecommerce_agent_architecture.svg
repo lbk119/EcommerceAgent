@@ -175,7 +175,7 @@
   <text x="715" y="1211" class="small">权限、注入防护、脱敏</text>
   <rect x="990" y="1168" width="250" height="54" class="chip"/>
   <text x="1015" y="1190" class="label">agent/evaluation</text>
-  <text x="1015" y="1211" class="small">Critic 质量评估和验收</text>
+  <text x="1015" y="1211" class="small">Evaluation 质量评估和验收</text>
   <rect x="1290" y="1168" width="250" height="54" class="chip"/>
   <text x="1315" y="1190" class="label">agent/reflection</text>
   <text x="1315" y="1211" class="small">策略复盘、演进日志</text>

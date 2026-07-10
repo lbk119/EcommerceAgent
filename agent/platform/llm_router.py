@@ -1,6 +1,6 @@
 """LLM 后端与语义 profile 路由。
 
-运行时代码只按 fast、standard、deep、critic 这些语义档位请求模型，不直接关心具体 provider、模型名、
+运行时代码只按 fast、standard、deep、evaluation 这些语义档位请求模型，不直接关心具体 provider、模型名、
 超时和重试策略。本文件负责懒加载 LangChain chat model，并把模型调用耗时、token 和错误写入 trace。
 """
 
@@ -147,8 +147,8 @@ class LLMRouter:
                 default_retries=1,
                 default_temperature=0.2,
             ),
-            "critic": self._profile(
-                name="critic",
+            "evaluation": self._profile(
+                name="evaluation",
                 canonical_prefix="LLM_FAST",
                 default_model=fast_model,
                 default_timeout=15,

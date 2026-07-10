@@ -20,7 +20,7 @@
 - AI 对话性能：高频经营问题在 AI Chat 中快速分流，复杂分析转入后台 standard/deep job；standard/deep 由 deepagents-native subagents 理解参数、选择授权工具并基于真实工具结果分析；模型或工具异常时返回 degraded/clarification；`AI_CHAT_MODEL_PROFILE=fast`、`AI_CHAT_LLM_TIMEOUT_SECONDS=8`、`AI_CHAT_TOTAL_TARGET_SECONDS=15` 用于约束 AI Chat 的成本和等待时间。
 - AI 对话规划：HTTP 受理阶段用 PlannerAgent 同步 fallback 生成轻量 `task_plan`，入队 payload 保留 `raw_user_question`、`task_plan` 和 `agent_query`；包装 prompt 不再参与规划，避免“天气”被包装词里的库存、商品、活动误判成业务 workflow。
 - AI 对话持久化：新增 MySQL `ai_chat_conversations`、`ai_chat_messages`、`ai_chat_runs`；完成消息保存 `structured_json` 并返回 `structuredResult`，刷新后可从后端恢复历史消息、任务状态和已完成结构化结果。
-- AgentRuntime profiles：新增 `realtime`、`standard`、`deep` 三档运行时。`realtime` 由 deepagents-native main agent 承接，但不挂工具和 subagents；`standard` 和 `deep` 统一走 deepagents-native main agent + business subagents；`deep` 允许更高预算、网络搜索、Critic、Memory、Evolution。
+- AgentRuntime profiles：新增 `realtime`、`standard`、`deep` 三档运行时。`realtime` 由 deepagents-native main agent 承接，但不挂工具和 subagents；`standard` 和 `deep` 统一走 deepagents-native main agent + business subagents；`deep` 允许更高预算、网络搜索、Evaluation、Memory、Evolution。
 - AgentRuntime budget：新增模型/工具/subagent/wall time 硬预算，默认 realtime 为 15s/1 model/3 tools/0 subagents，standard 为 45s/2 models/6 tools/1 subagent，deep 为 180s/6 models/12 tools/3 subagents；超预算会写入 `budget_exceeded` trace 并返回阶段性结果。
 - deepagents-native 业务执行：PlannerAgent 输出 `AgentTaskPlan` 和 `AgentAssignment`，只负责分派 Product/Inventory/Campaign/Report/DataQuality/KnowledgeBase/NetworkSearch/DatabaseQuery 等业务 subagent；deepagents main agent 根据依赖关系委托 subagents，并通过 `agent/tools` 注册工具和权限边界执行。
 - Agent 模块瘦身：旧固定执行层已从主链路移除并删除；Runtime、AI Chat、Agent Job 和 API 队列全部使用 `AgentTaskPlan`。
@@ -28,7 +28,7 @@
 - Runtime guard：deepagents-native 使用 RuntimeGuard/profile budget 控制模型、工具、subagent 调用次数和 wall time，替代旧固定 step executor/loop_guard。
 - Task queue profile 并发：后台队列在总并发 `MAX_AGENT_CONCURRENCY=10` 外，再按 `REALTIME_AGENT_CONCURRENCY`、`STANDARD_AGENT_CONCURRENCY`、`DEEP_AGENT_CONCURRENCY` 做 profile semaphore，默认 realtime=8、standard=2、deep=1，避免深度任务无预算挤占实时体验。
 - AgentRuntime health/metrics：新增 `/api/v1/agent-runtime/health`、`/api/v1/agent-runtime/metrics` 与 `/api/v1/agent-runtime/slow-tasks`，health 区分 `ok`、`disabled`、`not_started`、`jsonl_not_mysql`，不把未接入模块伪装成健康；慢任务接口用于排查 trace 中的高耗时 LLM、subagent 或 deepagents-native 阶段。
-- AgentRuntime diagnosis：新增 `/api/v1/agent-runtime/tasks/{task_id}/diagnosis`，按单任务返回总耗时、模型调用、工具调用、subagent 调用、Critic/Memory 事件、最慢阶段和优化建议。
+- AgentRuntime diagnosis：新增 `/api/v1/agent-runtime/tasks/{task_id}/diagnosis`，按单任务返回总耗时、模型调用、工具调用、subagent 调用、Evaluation/Memory 事件、最慢阶段和优化建议。
 - Agent 模块审计：新增 `scripts/audit_agent_modules.ps1`，输出每个 `agent`/`agent/subagent/checkpoint.py` Python 文件的模块分类、引用数量、是否热路径和治理建议。
 - 任务治理：AI Chat 提供 `POST /api/v1/ai-chat/tasks/{task_id}/cancel`，可取消 queued/running 任务并回写 MySQL 状态；已完成、失败或超时的任务保持终态不被覆盖。
 - 策略审核：approve/reject/defer 均按租户和店铺更新，不存在的 strategy 返回 404。
@@ -44,7 +44,7 @@
 - SQL 聚合保留为 Agent workflow 节点和数据库工具的数据来源，不再由 AI Chat API route 直接拼接固定答案。
 - 导入后经营概览仍是确定性摘要，用于数据接入后的快速反馈，不代表 Agent 深度分析。
 - 前端 AI 对话已移除本地伪回答 fallback；后端 AI Chat route 不再拼 SQL 固定回答。模型或 API key 未配置时，AI 对话会保留任务状态并显示真实失败/超时。
-- AI Chat 默认使用 `runtime_profile=realtime`：由 deepagents-native realtime main agent 承接，无工具、无 subagents、短预算；standard/realtime 默认跳过 Critic、长期记忆和结果 enrichment，deep profile 才启用完整 Runtime。
+- AI Chat 默认使用 `runtime_profile=realtime`：由 deepagents-native realtime main agent 承接，无工具、无 subagents、短预算；standard/realtime 默认跳过 Evaluation、长期记忆和结果 enrichment，deep profile 才启用完整 Runtime。
 
 ## 依赖真实模型或平台授权的能力
 
@@ -172,7 +172,7 @@ POST /api/v1/ai-chat/messages
 }
 ```
 
-进度事件来自 trace/WebSocket，常见阶段包括：`queued`、`prompt_guard_started/finished`、`task_classified`、`context_prepared`、`memory_retrieval_*`、`workflow_*`、`tool_call_*`、`llm_call_*`、`critic_*`、`persistence_*`、`memory_write_*`、`agent_finished/failed`。
+进度事件来自 trace/WebSocket，常见阶段包括：`queued`、`prompt_guard_started/finished`、`task_classified`、`context_prepared`、`memory_retrieval_*`、`workflow_*`、`tool_call_*`、`llm_call_*`、`evaluation_*`、`persistence_*`、`memory_write_*`、`agent_finished/failed`。
 
 补偿查询：
 

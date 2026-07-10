@@ -1,7 +1,7 @@
 """AgentRuntime 阶段化执行器。
 
 `run_agent_task` 会把请求交给这里完成 prompt guard、context/checkpoint 准备、deepagents-native 执行、
-Critic、持久化、记忆写入和 trace 收尾。每个阶段都有单独方法，方便 profile 裁剪、fallback 和非功能监控。
+Evaluation、持久化、记忆写入和 trace 收尾。每个阶段都有单独方法，方便 profile 裁剪、fallback 和非功能监控。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class AgentRuntime:
     """
     单个 Agent 图的运行时编排器。
 
-    每个方法对应一个架构阶段：prepare_context、retrieve_memory、execute_agent、run_critic、
+    每个方法对应一个架构阶段：prepare_context、retrieve_memory、execute_agent、run_evaluation、
     persist_result、write_memory、finalize_trace。
     """
 
@@ -65,7 +65,7 @@ class AgentRuntime:
             tracer.emit("runtime_budget_configured", trace_id=task_id, task_id=task_id, conversation_id=conversation_id, agent_name="agent_runtime", metadata=runtime_profile_config.budget.snapshot())
             self.retrieve_memory(context, task_plan)
             execution_result = await self.execute_agent(context, guard_result.sanitized_query, task_plan)
-            final_result, execution_metadata = await self.run_critic(context, execution_result, task_plan, runtime_profile=runtime_profile_config.name)
+            final_result, execution_metadata = await self.run_evaluation(context, execution_result, task_plan, runtime_profile=runtime_profile_config.name)
             reflection = self.persist_result(context, final_result, runtime_profile=runtime_profile_config.name)
             self.write_memory(context, final_result, reflection, execution_metadata, runtime_profile=runtime_profile_config.name)
             self.finalize_trace(context)
@@ -201,14 +201,14 @@ class AgentRuntime:
             raise RuntimeError(f"deepagents-native runtime is required for {runtime_profile} business assignments.")
         return await DeepAgentsNativeRuntime(self.agent).run(context, sanitized_query, task_plan)
 
-    async def run_critic(self, context: TaskRunContext, execution_result: ExecutionResult, task_plan: AgentTaskPlan, *, runtime_profile: str = "full") -> tuple[str, dict]:
-        """run_critic 阶段：执行 Critic policy、Critic 调用和最多一次 fix_instruction 修正。"""
-        from agent.runtime.result_pipeline import run_critic_stage
+    async def run_evaluation(self, context: TaskRunContext, execution_result: ExecutionResult, task_plan: AgentTaskPlan, *, runtime_profile: str = "full") -> tuple[str, dict]:
+        """run_evaluation 阶段：执行 Evaluation policy、Evaluation 调用和最多一次 fix_instruction 修正。"""
+        from agent.runtime.result_pipeline import run_evaluation_stage
 
         normalized_profile = normalize_runtime_profile(runtime_profile)
-        # 非 deep profile 默认跳过 Critic，把 AI Chat/standard 的热路径成本压低；可通过 env 临时开启。
-        if normalized_profile != "deep" and os.getenv("AI_CHAT_ENABLE_CRITIC", "false").lower() not in {"1", "true", "yes", "on"}:
-            tracer.emit("critic_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="critic_agent", metadata={"stage": "critic", "status": "skipped", "reason": "non_deep_profile", "runtime_profile": normalized_profile})
+        # 非 deep profile 默认跳过 Evaluation，把 AI Chat/standard 的热路径成本压低；可通过 env 临时开启。
+        if normalized_profile != "deep" and os.getenv("AI_CHAT_ENABLE_EVALUATION", "false").lower() not in {"1", "true", "yes", "on"}:
+            tracer.emit("evaluation_skipped", trace_id=context.task_id, task_id=context.task_id, conversation_id=context.conversation_id, agent_name="evaluation_agent", metadata={"stage": "evaluation", "status": "skipped", "reason": "non_deep_profile", "runtime_profile": normalized_profile})
             return execution_result.content, {
                 "source": execution_result.source,
                 "workflow_name": execution_result.workflow_name,
@@ -217,28 +217,28 @@ class AgentRuntime:
                 "section_errors": execution_result.section_errors(),
                 "fallback_reason": execution_result.fallback_reason,
                 "workflow_failed": execution_result.workflow_failed,
-                "critic_status": "skipped",
+                "evaluation_status": "skipped",
                 "runtime_profile": normalized_profile,
                 "plan_id": task_plan.plan_id,
                 "assignment_count": len(task_plan.assignments),
             }
 
-        async def rerun_with_critic_fix(fix_instruction: str) -> str:
+        async def rerun_with_evaluation_fix(fix_instruction: str) -> str:
             tracer.emit(
-                "critic_revision_skipped",
+            "evaluation_revision_skipped",
                 trace_id=context.task_id,
                 task_id=context.task_id,
                 conversation_id=context.conversation_id,
-                agent_name="critic_agent",
+                agent_name="evaluation_agent",
                 metadata={"reason": "deepagents_native_revision_disabled", "instruction_preview": fix_instruction[:500]},
             )
             return execution_result.content
 
-        critic_stage_result = await run_critic_stage(
+        evaluation_stage_result = await run_evaluation_stage(
             context,
             execution_result.content,
             agent_specs=self.agent_specs,
-            rerun_with_fix=rerun_with_critic_fix,
+            rerun_with_fix=rerun_with_evaluation_fix,
             task_plan=task_plan,
         )
         execution_metadata = {
@@ -249,11 +249,11 @@ class AgentRuntime:
             "section_errors": execution_result.section_errors(),
             "fallback_reason": execution_result.fallback_reason,
             "workflow_failed": execution_result.workflow_failed,
-            "critic_status": critic_stage_result.critic_status,
+            "evaluation_status": evaluation_stage_result.evaluation_status,
             "plan_id": task_plan.plan_id,
             "assignment_count": len(task_plan.assignments),
         }
-        return critic_stage_result.content, execution_metadata
+        return evaluation_stage_result.content, execution_metadata
 
     def persist_result(self, context: TaskRunContext, final_result: str, *, runtime_profile: str = "deep") -> dict:
         """persist_result 阶段：写 task_events、reflection 和 policy proposal。"""
